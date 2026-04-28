@@ -1,0 +1,263 @@
+#include "models.h"
+#include "llama-impl.h"
+#include "../llama-kv-cache.h"
+
+// DFlash Draft Model Graph Builder (REVISED — proper cross-attention)
+// ===================================================================
+// Architecture:
+//   - Two input paths:
+//     (a) inp_embd  : noise token embeddings  [n_embd, n_noise]
+//                     provided by caller (target.embed_tokens applied externally)
+//     (b) inp_dflash_ctx : pre-projected target context [n_embd, n_ctx]
+//                     caller applies fc+hidden_norm using dflash_fc/dflash_hidden_norm
+//                     weights from the GGUF before calling decode.
+//   - n_noise is known from hparams.n_dflash_block_size
+//   - n_ctx   = n_tokens - n_noise  (batch is structured as [ctx | noise])
+//
+// Per-layer cross-attention:
+//   cur   = LayerNorm(inpL_noise)                     [n_embd, n_noise]
+//   Q     = Wq(cur)           → [head_dim, n_head, n_noise]
+//   K_ctx = Wk(target_ctx)   → [head_dim, n_head_kv, n_ctx]
+//   K_nse = Wk(cur)          → [head_dim, n_head_kv, n_noise]
+//   K     = concat(K_ctx, K_nse, token_dim)
+//   V_ctx = Wv(target_ctx)   → [head_dim, n_head_kv, n_ctx]
+//   V_nse = Wv(cur)          → [head_dim, n_head_kv, n_noise]
+//   V     = concat(V_ctx, V_nse, token_dim)
+//   Q/K norms applied; RoPE applied to Q (noise pos) and K (all pos)
+//   Bidirectional flash-attn: Q[n_noise] × K/V[n_ctx+n_noise] → out[n_noise]
+//   Residual + FFN on noise path only.
+//
+// The graph does NOT apply fc+hidden_norm — those happen outside.
+// The caller must set up the batch as follows:
+//   - Positions 0 .. n_ctx-1   : filled with target_ctx floats via ubatch.embd
+//                                (first n_ctx * n_embd floats)
+//   - Positions n_ctx .. end   : filled with noise embeddings
+//                                (next n_noise * n_embd floats)
+// We split the embedding tensor inside the graph using views.
+// Both ctx and noise share the same n_embd dimension, so they fit in one tensor.
+
+llm_build_qwen3dflash::llm_build_qwen3dflash(
+    const llama_model & model,
+    const llm_graph_params & params) : llm_graph_context(params)
+{
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+    GGML_ASSERT(n_embd_head == n_rot);
+
+    // n_noise is fixed (block_size); n_ctx deduced at graph build time.
+    // During sched_reserve, n_tokens may be < n_noise (dummy batch). In that case,
+    // treat all tokens as noise (n_ctx=0) so the graph is valid for reservation.
+    const int64_t n_noise = (n_tokens >= (int64_t)hparams.n_dflash_block_size)
+        ? (int64_t)hparams.n_dflash_block_size
+        : n_tokens;
+    const int64_t n_ctx   = n_tokens - n_noise;
+    GGML_ASSERT(n_ctx >= 0);
+
+    ggml_tensor * cur;
+    ggml_tensor * inpL;
+
+    // ── build embedding input ──────────────────────────────────────────────
+    // The batch is structured as [ctx_tokens | noise_tokens].
+    // All tokens are provided as float embeddings (ubatch.embd is set).
+    // tok_embd may be nullptr for the draft model; use the float embd path directly.
+    {
+        auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        cb(inp->tokens, "inp_tokens", -1);
+        ggml_set_input(inp->tokens);
+        ggml_build_forward_expand(gf, inp->tokens); // ensure allocation
+
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        cb(inp->embd, "inp_embd", -1);
+        ggml_set_input(inp->embd);
+
+        // Full embedding tensor (ctx + noise packed together).
+        inpL = inp->embd;  // [n_embd, n_tokens]
+
+        res->t_inp_tokens = inp->tokens;
+        res->add_input(std::move(inp));
+    }
+
+    // ── split ctx and noise views ──────────────────────────────────────────
+    // ctx_embd  : first n_ctx tokens  [n_embd, n_ctx]
+    // noise_embd: last  n_noise tokens [n_embd, n_noise]
+    const size_t ctx_byte_offset   = 0;
+    const size_t noise_byte_offset = (size_t)n_ctx * inpL->nb[1];
+
+    ggml_tensor * target_ctx  = (n_ctx > 0)
+        ? ggml_view_2d(ctx0, inpL, hparams.n_embd, n_ctx,   inpL->nb[1], ctx_byte_offset)
+        : nullptr;
+    ggml_tensor * noise_embd  = ggml_view_2d(ctx0, inpL, hparams.n_embd, n_noise, inpL->nb[1], noise_byte_offset);
+
+    cb(noise_embd, "noise_embd", -1);
+    if (target_ctx) { cb(target_ctx, "target_ctx", -1); }
+
+    // Current noise hidden state (starts as the noise embeddings).
+    ggml_tensor * inpNoise = noise_embd;
+
+    // ── positional inputs ──────────────────────────────────────────────────
+    // inp_pos covers all positions: [pos_0 .. pos_{n_ctx+n_noise-1}]
+    // The first n_ctx entries are ctx positions; last n_noise are noise positions.
+    ggml_tensor * inp_pos = build_inp_pos();
+
+    // Separate position tensors for Q (noise) and K (all).
+    // Q RoPE: positions [n_ctx .. n_ctx+n_noise-1]
+    // K RoPE: positions [0    .. n_ctx+n_noise-1]
+    ggml_tensor * pos_noise = ggml_view_1d(ctx0, inp_pos, n_noise, (size_t)n_ctx * sizeof(int32_t));
+    // K uses all positions (inp_pos as-is)
+
+    // ── KV cache setup ────────────────────────────────────────────────────
+    // Build KV cache input for noise tokens only
+    auto * inp_attn = build_attn_inp_kv();
+
+    // ── decoder layers ────────────────────────────────────────────────────
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor * inpSA = inpNoise; // residual
+
+        // Pre-attention RMSNorm on noise tokens only
+        cur = build_norm(inpNoise,
+                model.layers[il].attn_norm, NULL,
+                LLM_NORM_RMS, il);
+        cb(cur, "attn_norm", il);
+
+        // ── Attention ─────────────────────────────────────────────────────
+        {
+            // Q from noise [n_embd, n_noise] → [n_head*head_dim, n_noise]
+            ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
+            cb(Qcur, "Qcur", il);
+
+            // K/V from noise
+            ggml_tensor * Kcur_noise = build_lora_mm(model.layers[il].wk, cur);
+            ggml_tensor * Vcur_noise = build_lora_mm(model.layers[il].wv, cur);
+
+            // Reshape noise K/V → [head_dim, n_head_kv, n_noise]
+            Kcur_noise = ggml_reshape_3d(ctx0, Kcur_noise, n_embd_head, n_head_kv, n_noise);
+            Vcur_noise = ggml_reshape_3d(ctx0, Vcur_noise, n_embd_head, n_head_kv, n_noise);
+
+            // Reshape Q → [head_dim, n_head, n_noise]
+            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_noise);
+
+            // Store noise K/V to cache BEFORE norm and RoPE
+            const auto * mctx_cur = inp_attn->mctx;
+            const auto & k_idxs = inp_attn->get_k_idxs();
+            const auto & v_idxs = inp_attn->get_v_idxs();
+
+            // Build forward expand for Q/K/V before storing to cache
+            ggml_build_forward_expand(gf, Qcur);
+            ggml_build_forward_expand(gf, Kcur_noise);
+            ggml_build_forward_expand(gf, Vcur_noise);
+
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur_noise, k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur_noise, v_idxs, il));
+
+            // Get full K/V from cache (includes history + current noise)
+            ggml_tensor * Kcur_cached = mctx_cur->get_k(ctx0, il);
+            ggml_tensor * Vcur_cached = mctx_cur->get_v(ctx0, il);
+
+            // K/V from target_ctx (if any context tokens exist)
+            ggml_tensor * Kcur, * Vcur;
+            if (target_ctx && n_ctx > 0) {
+                ggml_tensor * Kcur_ctx = build_lora_mm(model.layers[il].wk, target_ctx);
+                ggml_tensor * Vcur_ctx = build_lora_mm(model.layers[il].wv, target_ctx);
+
+                // Reshape: [n_head_kv*head_dim, n_ctx] → [head_dim, n_head_kv, n_ctx]
+                Kcur_ctx = ggml_reshape_3d(ctx0, Kcur_ctx, n_embd_head, n_head_kv, n_ctx);
+                Vcur_ctx = ggml_reshape_3d(ctx0, Vcur_ctx, n_embd_head, n_head_kv, n_ctx);
+
+                // Concat context K/V with cached K/V along token dim
+                // Kcur_ctx: [head_dim, n_head_kv, n_ctx]
+                // Kcur_cached: [head_dim, n_head_kv, n_cached] where n_cached includes history
+                Kcur = ggml_concat(ctx0, Kcur_ctx, Kcur_cached, 2);
+                Vcur = ggml_concat(ctx0, Vcur_ctx, Vcur_cached, 2);
+            } else {
+                // No context — use cached K/V only
+                Kcur = Kcur_cached;
+                Vcur = Vcur_cached;
+            }
+
+            // Q/K norms (Qwen3-style per-head RMS norm)
+            Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
+            cb(Qcur, "Qcur_normed", il);
+            Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
+            cb(Kcur, "Kcur_normed", il);
+
+            // RoPE: Q gets noise positions, K gets all positions
+            Qcur = ggml_rope_ext(ctx0, Qcur, pos_noise, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+            cb(Qcur, "Qcur_rope", il);
+
+            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+            cb(Kcur, "Kcur_rope", il);
+
+            // Transpose for flash_attn (matching build_attn_mha convention):
+            // Q: [head_dim, n_head, n_noise] → permute(0,2,1,3) → [head_dim, n_noise, n_head, 1]
+            // K: [head_dim, n_head_kv, n_kv] → permute(0,2,1,3) → [head_dim, n_kv,   n_head_kv, 1]
+            // V: [head_dim, n_head_kv, n_kv] → permute(0,2,1,3) → [head_dim, n_kv,   n_head_kv, 1]
+            Qcur = ggml_cont(ctx0, ggml_permute(ctx0, Qcur, 0, 2, 1, 3));
+            Kcur = ggml_cont(ctx0, ggml_permute(ctx0, Kcur, 0, 2, 1, 3));
+            Vcur = ggml_cont(ctx0, ggml_permute(ctx0, Vcur, 0, 2, 1, 3));
+
+            // Bidirectional cross-attention (no mask)
+            // flash_attn output: [v->ne[0]=head_dim, q->ne[2]=n_head, q->ne[1]=n_noise, 1]
+            ggml_tensor * kqv = ggml_flash_attn_ext(ctx0, Qcur, Kcur, Vcur,
+                    /*mask=*/nullptr,
+                    /*scale=*/1.0f / sqrtf((float)n_embd_head),
+                    /*max_bias=*/0.0f,
+                    /*logit_softcap=*/0.0f);
+            cb(kqv, LLAMA_TENSOR_NAME_FATTN, il);
+
+            // kqv: [head_dim, n_head, n_noise, 1] → reshape → [head_dim*n_head, n_noise] = [n_embd, n_noise]
+            kqv = ggml_reshape_2d(ctx0, kqv, kqv->ne[0] * kqv->ne[1], kqv->ne[2] * kqv->ne[3]);
+
+            // Output projection
+            cur = build_lora_mm(model.layers[il].wo, kqv);
+            cb(cur, "attn_out", il);
+        }
+
+        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+        cb(ffn_inp, "ffn_inp", il);
+
+        // FFN (noise path only)
+        cur = build_norm(ffn_inp,
+                model.layers[il].ffn_norm, NULL,
+                LLM_NORM_RMS, il);
+        cb(cur, "ffn_norm", il);
+
+        cur = build_ffn(cur,
+                model.layers[il].ffn_up,   NULL, NULL,
+                model.layers[il].ffn_gate, NULL, NULL,
+                model.layers[il].ffn_down, NULL, NULL,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(cur, "ffn_out", il);
+
+        inpNoise = ggml_add(ctx0, cur, ffn_inp);
+        cb(inpNoise, "l_out", il);
+    }
+    cur = inpNoise;
+
+    // Final RMSNorm on noise tokens
+    cur = build_norm(cur,
+            model.output_norm, NULL,
+            LLM_NORM_RMS, -1);
+    cb(cur, "result_norm", -1);
+
+    // When llama_set_embeddings=true the framework forces output_all=true,
+    // overriding n_outputs = n_tokens (ctx + noise), not just n_noise.
+    // The embeddings buffer read is: n_outputs * n_embd * sizeof(float).
+    // If t_embd has only n_noise rows the read goes out of bounds.
+    // Extend t_embd to cover all n_tokens by prepending the ctx rows unchanged.
+    if (n_ctx > 0) {
+        ggml_tensor * ctx_pass = ggml_view_2d(ctx0, inpL, n_embd, n_ctx, inpL->nb[1], 0);
+        cur = ggml_cont(ctx0, ggml_concat(ctx0, ctx_pass, cur, 1)); // [n_embd, n_tokens]
+    }
+    res->t_embd = cur;  // [n_embd, n_tokens] — noise rows at index n_ctx..n_tokens-1
+
+    // No lm_head in DFlash — caller applies target.lm_head externally.
+    res->t_logits = nullptr;
+
+    ggml_build_forward_expand(gf, cur);
+}
