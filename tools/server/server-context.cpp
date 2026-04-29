@@ -711,11 +711,6 @@ private:
                 params_base.n_cache_reuse = 0;
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
-
-            if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-                params_base.speculative.type =  COMMON_SPECULATIVE_TYPE_NONE;
-                SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
-            }
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx))) {
@@ -773,10 +768,6 @@ private:
             if (can_spec) {
                 slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
                 if (slot.spec) {
-                    if (mctx) {
-                        SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
-                        return false;
-                    }
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
                 } else {
                     SLT_INF(slot, "%s", "speculative decoding context not initialized\n");
@@ -2070,16 +2061,24 @@ private:
             //       perform the speculative drafting for all sequences at the same time in a single batch
             const int n_draft_max = slot.get_n_draft_max();
             if (n_draft_max > 0) {
-                if (mctx) {
-                    // we should never reach this, as speculative is automatically disabled if mmproj is loaded
-                    GGML_ABORT("not supported by multimodal");
+                // compute text-only tokens and position offset for mtmd (image tokens occupy KV
+                // positions but are invisible to the draft model; pos_offset corrects RoPE alignment)
+                llama_tokens cached_text_tokens_tmp;
+                const llama_tokens * p_cached_text_tokens;
+                llama_pos pos_offset = 0;
+                if (slot.prompt.tokens.has_mtmd) {
+                    cached_text_tokens_tmp = slot.prompt.tokens.get_text_tokens_for_draft();
+                    p_cached_text_tokens   = &cached_text_tokens_tmp;
+                    // For M-RoPE (Qwen3VL), pos_next() < tokens.size() because image tokens
+                    // share temporal positions.  Align draft KV so that the last text token
+                    // lands at pos_next()-1, keeping post-image text positions correct.
+                    pos_offset = slot.prompt.tokens.pos_next()
+                               - (llama_pos) cached_text_tokens_tmp.size();
+                } else {
+                    p_cached_text_tokens = &slot.prompt.tokens.get_text_tokens();
                 }
 
-                const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
-
-                const auto & params_spec = slot.task->params.speculative;
-
-                llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+                llama_tokens draft = common_speculative_draft(slot.spec, slot.task->params.speculative, *p_cached_text_tokens, slot.sampled, pos_offset);
 
                 if (draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
@@ -2904,7 +2903,7 @@ private:
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;

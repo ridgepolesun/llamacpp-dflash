@@ -28,11 +28,14 @@ void common_speculative_free(common_speculative * spec);
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
 
 // sample up to n_draft tokens and add them to the batch using the draft model
+// pos_offset: added to all KV positions — use when text tokens follow image embeddings (mtmd)
+//             so that draft model RoPE positions align with the target model
 llama_tokens common_speculative_draft(
                      common_speculative * spec,
         const common_params_speculative & params,
                      const llama_tokens & prompt,
-                            llama_token   id_last);
+                            llama_token   id_last,
+                            llama_pos     pos_offset = 0);
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);

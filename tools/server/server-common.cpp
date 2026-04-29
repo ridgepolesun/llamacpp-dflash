@@ -379,13 +379,27 @@ void server_tokens::push_back(server_tokens & tokens) {
 }
 
 void server_tokens::insert(const llama_tokens & inp_tokens) {
-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    // safe for mtmd: only appends text tokens at the end; map_idx_to_media is unaffected
     tokens.insert(tokens.end(), inp_tokens.begin(), inp_tokens.end());
 }
 
 const llama_tokens & server_tokens::get_text_tokens() const {
     GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     return tokens;
+}
+
+llama_tokens server_tokens::get_text_tokens_for_draft() const {
+    if (!has_mtmd) {
+        return tokens;
+    }
+    llama_tokens result;
+    result.reserve(tokens.size());
+    for (const auto & t : tokens) {
+        if (t != LLAMA_TOKEN_NULL) {
+            result.push_back(t);
+        }
+    }
+    return result;
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
