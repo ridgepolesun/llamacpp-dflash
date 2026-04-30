@@ -4773,6 +4773,10 @@ class DFlashDraftModel(Qwen3Model):
         num_selected = len(target_layer_ids) if target_layer_ids else num_target_layers
         self.gguf_writer.add_dflash_num_target_layers(num_selected)
         if target_layer_ids:
+            # HF extract_context_feature() uses hidden_states[layer_id + 1] because
+            # hidden_states[0] is the embedding (before block 0), and hidden_states[k]=output of block k-1.
+            # llama.cpp t_layer_hidden[il] = output of block il — same indexing as config layer_id.
+            # No offset correction needed.
             self.gguf_writer.add_dflash_target_layer_ids(target_layer_ids)
         if mask_token_id is not None:
             self.gguf_writer.add_mask_token_id(mask_token_id)

@@ -41,6 +41,19 @@ int main(int argc, char ** argv) {
     common_params params;
     common_init();
 
+    // ── Extract DFlash-specific args before common_params_parse ──────────────
+    // --draft-ctx-max N : cap the draft model's context window to N tokens (0 = unlimited)
+    int32_t arg_draft_ctx_max = 0;
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--draft-ctx-max") == 0) {
+            arg_draft_ctx_max = std::max(0, atoi(argv[i + 1]));
+            // Remove both argv[i] and argv[i+1] so common_params_parse doesn't see them
+            for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+            argc -= 2;
+            break;
+        }
+    }
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SPECULATIVE)) {
         return 1;
     }
@@ -187,6 +200,51 @@ int main(int argc, char ** argv) {
             return 1;
         }
         llama_set_hidden_capture_layers(ctx_tgt, nullptr, 0);
+
+        // Debug: verify hidden states and ctx_proj are non-zero after prefill
+        if (getenv("DFLASH_DEBUG_HIDDEN")) {
+            // Check raw hidden states (last layer, last token)
+            double hidden_sum = 0.0, hidden_sq = 0.0;
+            int hidden_nonzero = 0;
+            const int dbg_tok = n_prompt - 1;  // last prompt token
+            for (int li = 0; li < n_tgt_lyrs; li++) {
+                for (int d = 0; d < n_embd; d++) {
+                    float v = ctx_hidden_tmp[(size_t)(dbg_tok * n_tgt_lyrs + li) * n_embd + d];
+                    hidden_sum += v;
+                    hidden_sq  += (double)v * v;
+                    if (v != 0.0f) hidden_nonzero++;
+                }
+            }
+            fprintf(stderr, "%s: [debug] hidden_concat last_tok=%d: sum=%.4f rms=%.6f nonzero=%d/%d\n",
+                    __func__, dbg_tok, hidden_sum,
+                    sqrtf((float)(hidden_sq / (n_tgt_lyrs * n_embd))),
+                    hidden_nonzero, n_tgt_lyrs * n_embd);
+            // Check ctx_proj (last prompt token, first 8 values)
+            double proj_sum = 0.0;
+            int proj_nonzero = 0;
+            int proj_nan = 0;
+            for (int d = 0; d < n_embd; d++) {
+                float v = ctx_proj[(size_t)dbg_tok * n_embd + d];
+                if (std::isnan(v)) proj_nan++;
+                else if (v != 0.0f) { proj_sum += v; proj_nonzero++; }
+            }
+            fprintf(stderr, "%s: [debug] ctx_proj last_tok=%d: sum=%.4f nonzero=%d/%d nan=%d\n",
+                    __func__, dbg_tok, proj_sum, proj_nonzero, n_embd, proj_nan);
+            // Sample a few raw values from first layer, last token
+            fprintf(stderr, "%s: [debug] hidden layer=%d tok=%d first8:",
+                    __func__, tgt_layer_ids[0], dbg_tok);
+            for (int d = 0; d < 8 && d < n_embd; d++) {
+                float v = ctx_hidden_tmp[(size_t)(dbg_tok * n_tgt_lyrs + 0) * n_embd + d];
+                fprintf(stderr, " %.4f", v);
+            }
+            fprintf(stderr, "\n");
+            fprintf(stderr, "%s: [debug] ctx_proj tok=%d first8:", __func__, dbg_tok);
+            for (int d = 0; d < 8 && d < n_embd; d++) {
+                float v = ctx_proj[(size_t)dbg_tok * n_embd + d];
+                fprintf(stderr, " %.4f", v);
+            }
+            fprintf(stderr, "\n");
+        }
     }
 
     // ── GPU dflash proj (initialized after n_prompt is known) ─────────────────
@@ -200,6 +258,52 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "%s: GPU dflash proj unavailable, using CPU fallback\n", __func__);
         }
     }
+
+    // ── Hybrid model snapshot/replay support ────────────────────────────────
+    // Hybrid models (e.g. Qwen3.5 with Gated Delta Net + SWA) use
+    // llama_memory_hybrid_iswa which cannot handle partial seq_rm for recurrent layers.
+    // Fix: save recurrent-only snapshot (PARTIAL_ONLY) before each verification batch.
+    // On rejection, restore recurrent state + trim attention KV + replay accepted prefix.
+    //
+    // Detection: after prefill, compare PARTIAL_ONLY size vs full size.
+    //   - hybrid: PARTIAL_ONLY skips attention KV → sz_recr << sz_full (fixed small size)
+    //   - pure-attention: PARTIAL_ONLY == full state → sz_recr == sz_full (large, grows)
+    // Only save snapshots for hybrid models; pure-attention models never need them.
+    bool use_recr_snap = false;
+    size_t recr_snap_size = 0;   // cached (fixed for hybrid, 0 for pure-attention)
+    std::vector<uint8_t> recr_snap;
+    size_t recr_snap_written = 0;
+    llama_token tok_vb = LLAMA_TOKEN_NULL;  // tok at start of current verification batch
+    if (!no_draft) {
+        const size_t sz_full = llama_state_seq_get_size(ctx_tgt, 0);
+        const size_t sz_recr = llama_state_seq_get_size_ext(ctx_tgt, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        use_recr_snap = (sz_full > 0 && sz_recr < sz_full);
+        if (use_recr_snap) {
+            recr_snap_size = sz_recr;
+            recr_snap.resize(sz_recr);
+            fprintf(stderr, "%s: hybrid model — recurrent snapshot enabled (recr=%zu full=%zu)\n",
+                    __func__, sz_recr, sz_full);
+        }
+    }
+
+    // ── Draft ctx sliding window ──────────────────────────────────────────────
+    // ctx_proj grows by (1+n_accepted) each iteration → draft batch grows → O(n²) cost.
+    // Cap ctx_proj at max_ctx_window tokens: slide the window when exceeded.
+    // Set via --draft-ctx-max N (or DFLASH_MAX_CTX env var as fallback). 0 = unlimited.
+    int32_t max_ctx_window = arg_draft_ctx_max;
+    if (max_ctx_window == 0) {
+        const char * e = getenv("DFLASH_MAX_CTX");
+        if (e) max_ctx_window = std::max(0, atoi(e));
+    }
+    if (max_ctx_window > 0) {
+        fprintf(stderr, "%s: draft ctx window capped at %d tokens\n", __func__, max_ctx_window);
+    }
+
+    // Pre-allocate scratch buffers to avoid hot-path heap allocations.
+    // Max per-iter hidden tmp: n_noise tokens (full vb) * n_tgt_lyrs * n_embd.
+    std::vector<float> hidden_tmp_scratch(no_draft ? 0 : (size_t)n_noise * n_tgt_lyrs * n_embd);
+    // Max per-iter projection output: n_noise tokens * n_embd.
+    std::vector<float> proj_scratch(no_draft ? 0 : (size_t)n_noise * n_embd);
 
     // Sample first token from prefill logits
     llama_token tok = common_sampler_sample(smpl_tgt, ctx_tgt, -1);
@@ -273,10 +377,6 @@ int main(int argc, char ** argv) {
     std::vector<float> draft_embd((size_t)n_cands * n_embd);
     std::vector<float> draft_logits((size_t)n_cands * n_vocab);
     std::vector<llama_token> candidates(n_cands);
-
-    // Scratch buffer for 1-token hidden state extraction (n_tgt_lyrs * n_embd).
-    // ctx_hidden_tmp was sized for n_prompt tokens during prefill; resize to 1 token now.
-    ctx_hidden_tmp.resize((size_t)n_tgt_lyrs * n_embd);
 
     // === Per-phase timing accumulators =========================================
     int64_t t_draft_us    = 0;  // draft model forward (llama_decode)
@@ -403,7 +503,17 @@ int main(int argc, char ** argv) {
 
         // === Verify with target model ==========================================
         // tok NOT in KV yet. Decode vb = [tok | c0..c_{n_cands-1}].
-        // On rejection at ni: crop KV cache with llama_kv_cache_seq_rm (no replay needed).
+        // On rejection at ni: crop KV cache (pure-attention: seq_rm; hybrid: snapshot/replay).
+
+        // Save recurrent-only snapshot before verification (hybrid models only).
+        // For hybrid models: PARTIAL_ONLY → only recurrent state (fixed small size).
+        // Pure-attention models: seq_rm always succeeds, no snapshot needed.
+        if (use_recr_snap) {
+            recr_snap_written = llama_state_seq_get_data_ext(
+                    ctx_tgt, recr_snap.data(), recr_snap_size, 0,
+                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            tok_vb = tok;
+        }
         llama_set_hidden_capture_layers(ctx_tgt, tgt_layer_ids.data(), n_tgt_lyrs);
         {
             llama_batch vb = llama_batch_init(n_noise, 0, 1);
@@ -480,33 +590,40 @@ int main(int argc, char ** argv) {
                 if (llama_vocab_is_eog(vocab, tok)) goto done;
             } else {
                 // Rejected at ni.
-                // Extract hidden states from vb positions 0..ni (tok + accepted tokens before rejection).
-                const int32_t n_ctx_new = 1 + ni;  // tok + accepted tokens before rejection (ni total)
+                // Extract hidden states from vb positions 0..ni (tok + accepted before rejection).
+                const int32_t n_ctx_new = 1 + ni;
 
-                ctx_hidden_tmp.resize((size_t)n_ctx_new * n_tgt_lyrs * n_embd);
+                // Use pre-allocated scratch (sized for n_noise tokens, always enough).
                 for (int32_t li = 0; li < n_tgt_lyrs && ok; li++) {
                     const float * h_full = llama_get_layer_hidden(ctx_tgt, tgt_layer_ids[li]);
                     if (!h_full) { ok = false; break; }
                     for (int32_t t = 0; t < n_ctx_new; t++) {
-                        memcpy(ctx_hidden_tmp.data() + (size_t)(t * n_tgt_lyrs + li) * n_embd,
+                        memcpy(hidden_tmp_scratch.data() + (size_t)(t * n_tgt_lyrs + li) * n_embd,
                                h_full + (size_t)t * n_embd, n_embd * sizeof(float));
                     }
                 }
 
                 if (ok) {
-                    // Append new projected tokens to ctx_proj (accumulate across iterations)
-                    const int32_t n_ctx_old = n_ctx;
-                    std::vector<float> new_proj((size_t)n_ctx_new * n_embd);
+                    // Project and append to ctx_proj. Use pre-allocated proj_scratch.
                     const int64_t t0_proj = ggml_time_us();
                     ok = proj_gpu
-                        ? llama_dflash_proj_gpu_apply(proj_gpu, ctx_hidden_tmp.data(), new_proj.data(), n_ctx_new)
-                        : llama_model_dflash_project(model_dft, ctx_hidden_tmp.data(), new_proj.data(), n_ctx_new);
+                        ? llama_dflash_proj_gpu_apply(proj_gpu, hidden_tmp_scratch.data(), proj_scratch.data(), n_ctx_new)
+                        : llama_model_dflash_project(model_dft, hidden_tmp_scratch.data(), proj_scratch.data(), n_ctx_new);
                     t_project_us += ggml_time_us() - t0_proj;
                     if (ok) {
-                        ctx_proj.resize((size_t)(n_ctx_old + n_ctx_new) * n_embd);
-                        memcpy(ctx_proj.data() + (size_t)n_ctx_old * n_embd,
-                               new_proj.data(), (size_t)n_ctx_new * n_embd * sizeof(float));
-                        n_ctx = n_ctx_old + n_ctx_new;
+                        ctx_proj.resize((size_t)(n_ctx + n_ctx_new) * n_embd);
+                        memcpy(ctx_proj.data() + (size_t)n_ctx * n_embd,
+                               proj_scratch.data(), (size_t)n_ctx_new * n_embd * sizeof(float));
+                        n_ctx += n_ctx_new;
+                        // Sliding window: cap ctx_proj to avoid O(n²) draft cost.
+                        if (max_ctx_window > 0 && n_ctx > max_ctx_window) {
+                            const int32_t drop = n_ctx - max_ctx_window;
+                            memmove(ctx_proj.data(),
+                                    ctx_proj.data() + (size_t)drop * n_embd,
+                                    (size_t)max_ctx_window * n_embd * sizeof(float));
+                            ctx_proj.resize((size_t)max_ctx_window * n_embd);
+                            n_ctx = max_ctx_window;
+                        }
                     }
                 }
 
@@ -515,9 +632,39 @@ int main(int argc, char ** argv) {
                 fflush(stdout);
                 n_gen++;
 
-                // Crop KV cache: keep positions 0..n_past_before_vb+ni (tok + ni accepted)
-                // Equivalent to Python's past_key_values_target.crop(start) — no replay needed.
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_before_vb + 1 + ni, -1);
+                // Crop KV cache: keep positions 0..n_past_before_vb+ni (tok + ni accepted).
+                // For pure-attention models, seq_rm works directly (no replay needed).
+                // For hybrid/recurrent models (e.g. Qwen3.5), seq_rm on a partial range fails
+                // because llama_memory_recurrent::seq_rm returns false for partial tail crops.
+                // Fix: restore recurrent state (PARTIAL_ONLY, O(1)) → seq_rm attention KV → replay.
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_before_vb + 1 + ni, -1)) {
+                    GGML_ASSERT(use_recr_snap && recr_snap_written > 0 &&
+                                "seq_rm failed but no snapshot was saved — unexpected state");
+                    // Turn off hidden capture before replay (we already extracted what we need)
+                    llama_set_hidden_capture_layers(ctx_tgt, nullptr, 0);
+                    // 1. Restore recurrent state to before the verification batch.
+                    //    This moves the recurrent tail back to n_past_before_vb-1.
+                    llama_state_seq_set_data_ext(ctx_tgt, recr_snap.data(), recr_snap_written, 0,
+                                                 LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    // 2. Trim attention KV: remove all verification batch tokens.
+                    //    Now safe: recurrent tail < n_past_before_vb, so seq_rm succeeds.
+                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_before_vb, -1);
+                    // 3. Replay accepted prefix [tok_vb, c0, ..., c_{ni-1}] to rebuild state.
+                    //    (no logits needed — use false for want_logits)
+                    const int n_replay = 1 + ni;
+                    llama_batch rb = llama_batch_init(n_replay, 0, 1);
+                    rb.n_tokens = 0;
+                    common_batch_add(rb, tok_vb, (llama_pos)n_past_before_vb, {0}, false);
+                    for (int32_t ri = 0; ri < ni; ri++) {
+                        common_batch_add(rb, candidates[ri], (llama_pos)(n_past_before_vb + 1 + ri), {0}, false);
+                    }
+                    if (llama_decode(ctx_tgt, rb) != 0) {
+                        fprintf(stderr, "\n%s: hybrid replay decode failed\n", __func__);
+                        llama_batch_free(rb);
+                        ok = false;
+                    }
+                    llama_batch_free(rb);
+                }
 
                 // n_past = orig_tok + accepted (correction tok not yet decoded)
                 n_past = n_past_before_vb + 1 + n_accepted;
@@ -534,43 +681,38 @@ int main(int argc, char ** argv) {
         if (!rejected) {
             // All n_cands accepted.
             // Extract hidden states from vb positions 0..n_cands (tok + all candidates).
-            // These become the context for the next draft run.
-            const int32_t n_ctx_new = 1 + n_cands;  // original token + all accepted candidates
+            const int32_t n_ctx_new = 1 + n_cands;
 
-            // Resize to hold hidden states for n_ctx_new tokens across n_tgt_lyrs layers
-            ctx_hidden_tmp.resize((size_t)n_ctx_new * n_tgt_lyrs * n_embd);
-
-            // For each layer we want to capture, get its hidden representation for each token position
+            // Use pre-allocated scratch (sized for n_noise = 1+n_cands tokens).
             for (int32_t li = 0; li < n_tgt_lyrs && ok; li++) {
                 const float * h_full = llama_get_layer_hidden(ctx_tgt, tgt_layer_ids[li]);
-                if (!h_full) {
-                    ok = false;
-                    break;
-                }
-
-                // Extract hidden representations for all token positions (0 to n_cands inclusive)
-                for (int32_t t = 0; t < n_ctx_new && ok; t++) {
-                    // Copy the hidden state for token position t, layer li
-                    // h_full is organized as [pos_0_layer_li, pos_1_layer_li, ..., pos_n_layer_li]
-                    memcpy(ctx_hidden_tmp.data() + (size_t)(t * n_tgt_lyrs + li) * n_embd,
+                if (!h_full) { ok = false; break; }
+                for (int32_t t = 0; t < n_ctx_new; t++) {
+                    memcpy(hidden_tmp_scratch.data() + (size_t)(t * n_tgt_lyrs + li) * n_embd,
                            h_full + (size_t)t * n_embd, n_embd * sizeof(float));
                 }
             }
 
             if (ok) {
-                // Append new projected tokens to ctx_proj (accumulate across iterations)
-                const int32_t n_ctx_old = n_ctx;
-                std::vector<float> new_proj((size_t)n_ctx_new * n_embd);
                 const int64_t t0_proj = ggml_time_us();
                 ok = proj_gpu
-                    ? llama_dflash_proj_gpu_apply(proj_gpu, ctx_hidden_tmp.data(), new_proj.data(), n_ctx_new)
-                    : llama_model_dflash_project(model_dft, ctx_hidden_tmp.data(), new_proj.data(), n_ctx_new);
+                    ? llama_dflash_proj_gpu_apply(proj_gpu, hidden_tmp_scratch.data(), proj_scratch.data(), n_ctx_new)
+                    : llama_model_dflash_project(model_dft, hidden_tmp_scratch.data(), proj_scratch.data(), n_ctx_new);
                 t_project_us += ggml_time_us() - t0_proj;
                 if (ok) {
-                    ctx_proj.resize((size_t)(n_ctx_old + n_ctx_new) * n_embd);
-                    memcpy(ctx_proj.data() + (size_t)n_ctx_old * n_embd,
-                           new_proj.data(), (size_t)n_ctx_new * n_embd * sizeof(float));
-                    n_ctx = n_ctx_old + n_ctx_new;
+                    ctx_proj.resize((size_t)(n_ctx + n_ctx_new) * n_embd);
+                    memcpy(ctx_proj.data() + (size_t)n_ctx * n_embd,
+                           proj_scratch.data(), (size_t)n_ctx_new * n_embd * sizeof(float));
+                    n_ctx += n_ctx_new;
+                    // Sliding window: cap ctx_proj to avoid O(n²) draft cost.
+                    if (max_ctx_window > 0 && n_ctx > max_ctx_window) {
+                        const int32_t drop = n_ctx - max_ctx_window;
+                        memmove(ctx_proj.data(),
+                                ctx_proj.data() + (size_t)drop * n_embd,
+                                (size_t)max_ctx_window * n_embd * sizeof(float));
+                        ctx_proj.resize((size_t)max_ctx_window * n_embd);
+                        n_ctx = max_ctx_window;
+                    }
                 }
             }
             if (!ok) break;
