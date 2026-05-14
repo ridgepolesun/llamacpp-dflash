@@ -489,6 +489,7 @@ extern "C" {
         GGML_OP_CUMSUM,
         GGML_OP_MEAN,
         GGML_OP_ARGMAX,
+        GGML_OP_LSE,
         GGML_OP_COUNT_EQUAL,
         GGML_OP_REPEAT,
         GGML_OP_REPEAT_BACK,
@@ -1038,6 +1039,11 @@ extern "C" {
 
     // argmax along rows
     GGML_API struct ggml_tensor * ggml_argmax(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // log-sum-exp along rows: lse[i] = max + log(sum(exp(x - max)))
+    GGML_API struct ggml_tensor * ggml_lse(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 

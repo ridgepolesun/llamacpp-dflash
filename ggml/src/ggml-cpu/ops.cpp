@@ -1607,6 +1607,66 @@ void ggml_compute_forward_argmax(
     }
 }
 
+// ggml_compute_forward_lse
+
+static void ggml_compute_forward_lse_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+
+    const size_t nb01 = src0->nb[1];
+
+    for (int64_t i1 = 0; i1 < ne01; i1++) {
+        const float * src = (const float *) ((char *) src0->data + i1*nb01);
+        float * dst_ = (float *) ((char *)  dst->data + i1*dst->nb[0]);
+
+        float max_val = -INFINITY;
+        for (int64_t i0 = 0; i0 < ne00; i0++) {
+            if (src[i0] > max_val) {
+                max_val = src[i0];
+            }
+        }
+
+        float sum_exp = 0.0f;
+        for (int64_t i0 = 0; i0 < ne00; i0++) {
+            const float diff = src[i0] - max_val;
+            if (diff > -30.0f) {
+                sum_exp += expf(diff);
+            }
+        }
+
+        dst_[0] = max_val + logf(sum_exp);
+    }
+}
+
+void ggml_compute_forward_lse(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_lse_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_count_equal
 
 static void ggml_compute_forward_count_equal_i32(

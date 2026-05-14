@@ -9465,13 +9465,15 @@ bool llama_model_apply_lm_head(
 #include "ggml-alloc.h"
 
 struct llama_lm_head_gpu {
-    ggml_backend_t     backend    = nullptr;  // owns the compute backend
-    bool               own_backend = false;   // whether we created (and must free) it
-    ggml_context     * ctx        = nullptr;
-    ggml_gallocr_t     galloc     = nullptr;
-    ggml_cgraph      * gf         = nullptr;
-    ggml_tensor      * inp_embd   = nullptr;  // input:  [n_embd, n_batch]
-    ggml_tensor      * out_logits = nullptr;  // output: [n_vocab, n_batch]
+    ggml_backend_t        backend    = nullptr;  // owns the compute backend
+    bool                  own_backend = false;   // whether we created (and must free) it
+    ggml_context        * ctx        = nullptr;
+    ggml_gallocr_t        galloc     = nullptr;
+    ggml_cgraph         * gf         = nullptr;
+    ggml_tensor         * inp_embd   = nullptr;  // input:  [n_embd, n_batch]
+    ggml_tensor         * out_logits = nullptr;  // output: [n_vocab, n_batch]
+    ggml_tensor         * out_argmax = nullptr;  // output: [n_batch] (i32) — per-row argmax
+    ggml_tensor         * out_lse    = nullptr;  // output: [n_batch] (f32) — per-row log-sum-exp
     int32_t n_embd = 0, n_vocab = 0, n_batch = 0;
     bool ok = false;
 };
@@ -9529,8 +9531,18 @@ llama_lm_head_gpu * llama_lm_head_gpu_create(const llama_model * model, int32_t 
     cur = ggml_mul_mat(ctx, const_cast<ggml_tensor *>(output_w), cur);
     ggml_set_name(cur, "lmh_logits");
 
+    // Per-row argmax of logits — computed on GPU as part of the graph
+    ggml_tensor * out_argmax = ggml_argmax(ctx, cur);
+    ggml_set_name(out_argmax, "lmh_argmax");
+
+    // Per-row log-sum-exp of logits — computed on GPU as part of the graph
+    ggml_tensor * out_lse = ggml_lse(ctx, cur);
+    ggml_set_name(out_lse, "lmh_lse");
+
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, cur);
+    ggml_build_forward_expand(gf, out_argmax);
+    ggml_build_forward_expand(gf, out_lse);
 
     // Allocate all unallocated tensors (inp_embd + intermediates + out_logits) on buft
     // model's output_w / output_norm_w already have buffers — gallocr skips them
@@ -9558,6 +9570,8 @@ llama_lm_head_gpu * llama_lm_head_gpu_create(const llama_model * model, int32_t 
     lmh->gf          = gf;
     lmh->inp_embd    = inp_embd;
     lmh->out_logits  = cur;
+    lmh->out_argmax  = out_argmax;
+    lmh->out_lse     = out_lse;
     lmh->n_embd      = (int32_t)n_embd;
     lmh->n_vocab     = (int32_t)n_vocab;
     lmh->n_batch     = n_batch;
@@ -9592,6 +9606,44 @@ bool llama_lm_head_gpu_apply(llama_lm_head_gpu * lmh,
     // Download logits from GPU to host
     ggml_backend_tensor_get(lmh->out_logits, logits, 0,
                             (size_t)n_tokens * lmh->n_vocab * sizeof(float));
+    return true;
+}
+
+bool llama_lm_head_gpu_apply_lse(llama_lm_head_gpu * lmh,
+                                  const float       * embd,
+                                        float       * logits,
+                                        float       * lse_out,
+                                        int32_t     * argmax_out,
+                                        int32_t       n_tokens) {
+    if (!lmh || !lmh->ok) return false;
+    if (n_tokens > lmh->n_batch) return false;
+
+    const size_t used_embd    = (size_t)n_tokens     * lmh->n_embd * sizeof(float);
+    const size_t total_embd   = (size_t)lmh->n_batch * lmh->n_embd * sizeof(float);
+
+    // Upload embeddings to GPU input tensor
+    ggml_backend_tensor_set(lmh->inp_embd, embd, 0, used_embd);
+    if (used_embd < total_embd) {
+        ggml_backend_tensor_memset(lmh->inp_embd, 0, used_embd, total_embd - used_embd);
+    }
+
+    // Run the graph on the GPU backend (includes argmax + LSE)
+    if (ggml_backend_graph_compute(lmh->backend, lmh->gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    // Download argmax from GPU (tiny: n_tokens ints)
+    ggml_backend_tensor_get(lmh->out_argmax, argmax_out, 0,
+                            (size_t)n_tokens * sizeof(int32_t));
+
+    // Download LSE from GPU (tiny: n_tokens floats)
+    ggml_backend_tensor_get(lmh->out_lse, lse_out, 0,
+                            (size_t)n_tokens * sizeof(float));
+
+    // Download full logits from GPU to host (needed for accept/reject loop)
+    ggml_backend_tensor_get(lmh->out_logits, logits, 0,
+                            (size_t)n_tokens * lmh->n_vocab * sizeof(float));
+
     return true;
 }
 

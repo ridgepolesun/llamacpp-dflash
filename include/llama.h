@@ -664,6 +664,15 @@ extern "C" {
         const float              * embd,    // host float [n_batch, n_embd]
               float              * logits,  // host float [n_batch, n_vocab]  (caller allocates)
               int32_t              n_tokens); // must be <= n_batch
+    // Like llama_lm_head_gpu_apply, but also computes per-row LSE (log-sum-exp)
+    // and argmax on GPU, avoiding a costly CPU exp() loop over n_vocab.
+    LLAMA_API bool llama_lm_head_gpu_apply_lse(
+        struct llama_lm_head_gpu * lmh,
+        const float              * embd,       // host float [n_batch, n_embd]
+              float              * logits,     // host float [n_batch, n_vocab]  (caller allocates)
+              float              * lse_out,    // host float [n_batch]  — GPU-computed LSE per row
+              int32_t            * argmax_out, // host int32 [n_batch]  — GPU-computed argmax index per row
+              int32_t              n_tokens);    // must be <= n_batch
     LLAMA_API void llama_lm_head_gpu_free(struct llama_lm_head_gpu * lmh);
     // Returns the compute backend owned by lm_head_gpu (for sharing with other GPU ops).
     LLAMA_API ggml_backend_t llama_lm_head_gpu_get_backend(struct llama_lm_head_gpu * lmh);

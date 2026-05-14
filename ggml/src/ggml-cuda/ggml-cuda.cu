@@ -7,6 +7,7 @@
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argmax.cuh"
+#include "ggml-cuda/lse.cuh"
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/binbcast.cuh"
 #include "ggml-cuda/clamp.cuh"
@@ -2493,6 +2494,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
             break;
+        case GGML_OP_LSE:
+            ggml_cuda_lse(ctx, dst);
+            break;
         case GGML_OP_COUNT_EQUAL:
             ggml_cuda_count_equal(ctx, dst);
             break;
@@ -4913,6 +4917,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
             } break;
         case GGML_OP_ARGMAX:
+        case GGML_OP_LSE:
         case GGML_OP_COUNT_EQUAL:
             {
                 return true;
@@ -5220,6 +5225,14 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Accessor to get the CUDA context from a ggml_backend handle.
+// Used by lse.cu to launch kernels on the correct CUDA stream.
+static ggml_backend_cuda_context * ggml_backend_cuda_get_context_fn(ggml_backend_t backend) {
+    if (!backend) return nullptr;
+    if (backend->guid != ggml_backend_cuda_guid()) return nullptr;
+    return (ggml_backend_cuda_context *)backend->context;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
@@ -5233,6 +5246,24 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_cuda_lse_argmax") == 0) {
+        return (void *)ggml_cuda_lse_argmax;
+    }
+    if (strcmp(name, "ggml_cuda_lse_argmax_alloc") == 0) {
+        return (void *)ggml_cuda_lse_argmax_alloc;
+    }
+    if (strcmp(name, "ggml_cuda_lse_argmax_free") == 0) {
+        return (void *)ggml_cuda_lse_argmax_free;
+    }
+    if (strcmp(name, "ggml_cuda_lse_argmax_download") == 0) {
+        return (void *)ggml_cuda_lse_argmax_download;
+    }
+    if (strcmp(name, "ggml_cuda_lse_argmax_on_backend") == 0) {
+        return (void *)ggml_cuda_lse_argmax_on_backend;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_context") == 0) {
+        return (void *)ggml_backend_cuda_get_context_fn;
     }
     return nullptr;
 }

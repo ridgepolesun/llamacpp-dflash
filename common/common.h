@@ -860,6 +860,16 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
 
 std::string                   get_model_endpoint();
 
+enum common_context_seq_rm_type {
+    COMMON_CONTEXT_SEQ_RM_TYPE_NO   = 0, // seq_rm not supported (e.g. no memory module)
+    COMMON_CONTEXT_SEQ_RM_TYPE_PART = 1, // can seq_rm partial sequences
+    COMMON_CONTEXT_SEQ_RM_TYPE_FULL = 2, // can seq_rm full sequences only
+};
+
+// check if the llama_context can remove sequences
+// note: clears the memory of the context
+common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
+
 //
 // Batch utils
 //

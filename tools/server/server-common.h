@@ -189,6 +189,9 @@ public:
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const llama_tokens & get_text_tokens() const;
 
+    // direct access to all tokens (including LLAMA_TOKEN_NULL for mtmd)
+    const llama_tokens & get_tokens() const { return tokens; }
+
     // for speculative decoding with mtmd: returns text-only tokens (LLAMA_TOKEN_NULL filtered out)
     llama_tokens get_text_tokens_for_draft() const;
 
