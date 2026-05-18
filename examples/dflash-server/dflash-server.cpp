@@ -35,6 +35,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <future>
 #include <vector>
 
 using json = nlohmann::ordered_json;
@@ -144,10 +145,7 @@ struct DFlashEngine {
     std::vector<float>       noise_embd;
     std::vector<float>       draft_embd;
     std::vector<float>       draft_logits;
-    std::vector<float>       draft_lse;      // log-sum-exp of draft_logits, per candidate
     std::vector<llama_token> candidates;
-    std::vector<float>       gpu_lse_buf;    // GPU LSE output [n_cands]
-    std::vector<int32_t>     gpu_argmax_buf; // GPU argmax output [n_cands]
     std::vector<float>       hidden_tmp_scratch;
     std::vector<float>       proj_scratch;
     // ctx_proj and ctx_hidden_tmp are resized per-request (vary with n_prompt)
@@ -157,6 +155,8 @@ struct DFlashEngine {
     // ── Hybrid snapshot support ────────────────────────────────────────────
     bool   use_recr_snap       = false;
     bool   recr_snap_init_done = false;
+    llama_gpu_snapshot * gpu_snap = nullptr;
+    // CPU fallback (used if GPU snapshot unavailable)
     size_t recr_snap_size      = 0;
     std::vector<uint8_t> recr_snap;
 
@@ -254,9 +254,6 @@ struct DFlashEngine {
             draft_embd      .resize((size_t)n_cands * n_embd);
             draft_logits    .resize((size_t)n_cands * n_vocab);
             candidates      .resize(n_cands);
-            draft_lse       .resize(n_cands);
-            gpu_lse_buf     .resize(n_cands);
-            gpu_argmax_buf  .resize(n_cands);
             hidden_tmp_scratch.resize((size_t)n_noise * n_tgt_lyrs * n_embd);
             proj_scratch    .resize((size_t)n_noise * n_embd);
         }
@@ -303,10 +300,16 @@ struct DFlashEngine {
         int64_t t_prefill_us = 0;
         int64_t t_draft_us = 0, t_verify_us = 0, t_lmhead_us = 0, t_project_us = 0;
         int64_t t_snap_save_us = 0, t_snap_restore_us = 0, t_hidden_extract_us = 0;
-        int64_t t_draft_lse_us = 0, t_tgt_lse_us = 0, t_residual_us = 0, t_ctxproj_us = 0;
+        int64_t t_ctxproj_us = 0;
         int64_t t_decode_us = 0;
         int64_t t_decode_start = 0;
         int64_t n_iters = 0;
+        int64_t t_noise_build_us = 0;
+        int64_t t_batch_build_us = 0;
+        int64_t t_embd_collect_us = 0;
+        int64_t t_accept_us = 0;
+        int64_t t_kv_crop_us = 0;
+        int64_t t_sampler_us = 0;
 
         // ── Prefill ──────────────────────────────────────────────────────
         const int64_t t_prefill_start = ggml_time_us();
@@ -347,9 +350,14 @@ struct DFlashEngine {
                         ctx_tgt, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 use_recr_snap = (sz_full > 0 && sz_recr < sz_full);
                 if (use_recr_snap) {
-                    recr_snap_size = sz_recr;
-                    recr_snap.resize(sz_recr);
-                    fprintf(stderr, "%s: hybrid model — recurrent snapshot enabled\n", __func__);
+                    gpu_snap = llama_gpu_snapshot_create(ctx_tgt);
+                    if (gpu_snap) {
+                        fprintf(stderr, "%s: hybrid model — GPU snapshot enabled\n", __func__);
+                    } else {
+                        recr_snap_size = sz_recr;
+                        recr_snap.resize(sz_recr);
+                        fprintf(stderr, "%s: hybrid model — CPU snapshot fallback\n", __func__);
+                    }
                 }
                 recr_snap_init_done = true;
             }
@@ -421,14 +429,19 @@ struct DFlashEngine {
                 n_iters++;
 
                 // Build noise_embd: [embed(tok), mask, ..., mask]
-                if (!llama_model_get_token_embd(model_tgt, tok, tok_embd_buf.data(), n_embd)) break;
-                memcpy(noise_embd.data(), tok_embd_buf.data(), n_embd * sizeof(float));
-                for (int32_t ni = 1; ni < n_noise; ni++)
-                    memcpy(noise_embd.data() + (size_t)ni * n_embd, mask_embd.data(), n_embd * sizeof(float));
+                {
+                    int64_t t0_nb = ggml_time_us();
+                    if (!llama_model_get_token_embd(model_tgt, tok, tok_embd_buf.data(), n_embd)) break;
+                    memcpy(noise_embd.data(), tok_embd_buf.data(), n_embd * sizeof(float));
+                    for (int32_t ni = 1; ni < n_noise; ni++)
+                        memcpy(noise_embd.data() + (size_t)ni * n_embd, mask_embd.data(), n_embd * sizeof(float));
+                    t_noise_build_us += ggml_time_us() - t0_nb;
+                }
 
                 // Draft decode: full [ctx | noise] batch
                 const int32_t n_dft = n_ctx + n_noise;
                 {
+                    int64_t t0_bb = ggml_time_us();
                     llama_batch dft_b = llama_batch_init(n_dft, n_embd, 1);
                     dft_b.n_tokens = 0;
                     for (int32_t t = 0; t < n_ctx; t++)
@@ -439,47 +452,42 @@ struct DFlashEngine {
                                        (llama_pos)(n_ctx + ni), 0, true);
                     llama_set_embeddings(ctx_dft, true);
                     llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+                    t_batch_build_us += ggml_time_us() - t0_bb;
                     int64_t t0 = ggml_time_us();
                     bool dft_ok = llama_decode(ctx_dft, dft_b) == 0;
                     t_draft_us += ggml_time_us() - t0;
+                    int64_t t0_bf = ggml_time_us();
                     llama_batch_free(dft_b);
+                    t_batch_build_us += ggml_time_us() - t0_bf;
                     if (!dft_ok) { ok = false; }
                 }
                 if (!ok) break;
 
                 // Collect draft embeddings (last n_cands noise outputs)
-                for (int32_t ni = 0; ni < n_cands && ok; ni++) {
-                    const float * e = llama_get_embeddings_ith(ctx_dft, n_ctx + 1 + ni);
-                    if (!e) { ok = false; break; }
-                    memcpy(draft_embd.data() + (size_t)ni * n_embd, e, n_embd * sizeof(float));
+                {
+                    int64_t t0_ec = ggml_time_us();
+                    for (int32_t ni = 0; ni < n_cands && ok; ni++) {
+                        const float * e = llama_get_embeddings_ith(ctx_dft, n_ctx + 1 + ni);
+                        if (!e) { ok = false; break; }
+                        memcpy(draft_embd.data() + (size_t)ni * n_embd, e, n_embd * sizeof(float));
+                    }
+                    llama_set_embeddings(ctx_dft, false);
+                    t_embd_collect_us += ggml_time_us() - t0_ec;
                 }
-                llama_set_embeddings(ctx_dft, false);
                 if (!ok) break;
 
-                // Apply target lm_head to draft embeddings + GPU LSE/argmax
+                // Apply target lm_head to draft embeddings → greedy argmax
                 {
                     int64_t t0 = ggml_time_us();
                     bool lmh_ok;
                     if (lmh_gpu) {
-                        lmh_ok = llama_lm_head_gpu_apply_lse(lmh_gpu, draft_embd.data(),
-                                draft_logits.data(), gpu_lse_buf.data(), gpu_argmax_buf.data(), n_cands);
-                        if (lmh_ok) {
-                            for (int32_t ni = 0; ni < n_cands; ni++) {
-                                draft_lse[ni] = gpu_lse_buf[ni];
-                                candidates[ni] = (llama_token)gpu_argmax_buf[ni];
-                            }
-                        }
+                        lmh_ok = llama_lm_head_gpu_apply_argmax(lmh_gpu, draft_embd.data(),
+                                candidates.data(), n_cands);
                     } else {
                         lmh_ok = llama_model_apply_lm_head(model_tgt, draft_embd.data(), draft_logits.data(), n_cands, false);
                         if (lmh_ok) {
                             for (int32_t ni = 0; ni < n_cands; ni++) {
                                 const float * lg = draft_logits.data() + (size_t)ni * n_vocab;
-                                float max_lg = *std::max_element(lg, lg + n_vocab);
-                                float sum_exp = 0.0f;
-                                for (int32_t v = 0; v < n_vocab; v++) {
-                                    sum_exp += expf(lg[v] - max_lg);
-                                }
-                                draft_lse[ni] = max_lg + logf(sum_exp);
                                 candidates[ni] = (llama_token)(std::max_element(lg, lg + n_vocab) - lg);
                             }
                         }
@@ -491,9 +499,14 @@ struct DFlashEngine {
                 // Save snapshot (hybrid models) before verification
                 if (use_recr_snap) {
                     int64_t t0_snap = ggml_time_us();
-                    recr_snap_written = llama_state_seq_get_data_ext(
-                            ctx_tgt, recr_snap.data(), recr_snap_size, 0,
-                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (gpu_snap) {
+                        llama_gpu_snapshot_save(ctx_tgt, gpu_snap, 0,
+                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    } else {
+                        recr_snap_written = llama_state_seq_get_data_ext(
+                                ctx_tgt, recr_snap.data(), recr_snap_size, 0,
+                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
                     t_snap_save_us += ggml_time_us() - t0_snap;
                     tok_vb = tok;
                 }
@@ -501,90 +514,49 @@ struct DFlashEngine {
                 // Verification batch: [tok @ n_past | c0..c_{n_cands-1}]
                 llama_set_hidden_capture_layers(ctx_tgt, tgt_layer_ids.data(), n_tgt_lyrs);
                 {
+                    int64_t t0_bb2 = ggml_time_us();
                     llama_batch vb = llama_batch_init(n_noise, 0, 1);
                     vb.n_tokens = 0;
                     common_batch_add(vb, tok, (llama_pos)n_past, {0}, true);
                     for (int32_t ni = 0; ni < n_cands; ni++)
                         common_batch_add(vb, candidates[ni], (llama_pos)(n_past + 1 + ni), {0}, true);
+                    t_batch_build_us += ggml_time_us() - t0_bb2;
                     int64_t t0 = ggml_time_us();
                     bool vb_ok = llama_decode(ctx_tgt, vb) == 0;
                     t_verify_us += ggml_time_us() - t0;
+                    int64_t t0_bf2 = ggml_time_us();
                     llama_batch_free(vb);
+                    t_batch_build_us += ggml_time_us() - t0_bf2;
                     if (!vb_ok) { ok = false; }
                 }
                 if (!ok) break;
 
-                // Accept / reject (log-space probabilistic acceptance)
-                // Accept draft token x with prob min(1, p_target(x)/p_draft(x)).
-                // All in log-space: no full softmax arrays needed.
-                //   accept_prob = min(1, exp(tlogits[x] - lse_t - dl[x] + lse_d[ni]))
-                // On rejection, single-pass residual sampling.
+                // Accept / reject (greedy acceptance)
+                // Accept draft token if argmax(target_logits) == draft token.
+                // On rejection, use target argmax as corrected token.
                 const int32_t n_past_before_vb = n_past;
                 int32_t n_accepted = 0;
                 bool    rejected   = false;
 
                 for (int32_t ni = 0; ni < n_cands && n_gen < max_tokens; ni++) {
+                    int64_t t0_acc = ggml_time_us();
                     const float * tlogits = llama_get_logits_ith(ctx_tgt, ni);
-                    const float * dl      = draft_logits.data() + (size_t)ni * n_vocab;
                     const llama_token x   = candidates[ni]; // draft token
 
-                    // Compute target log-sum-exp (one pass, no array write)
-                    float lse_t;
-                    { int64_t t0_tlse = ggml_time_us();
-                    float max_tl = *std::max_element(tlogits, tlogits + n_vocab);
-                    float sum_exp_tl = 0.0f;
-                    for (int32_t v = 0; v < n_vocab; v++) {
-                        sum_exp_tl += expf(tlogits[v] - max_tl);
-                    }
-                    lse_t = max_tl + logf(sum_exp_tl);
-                    t_tgt_lse_us += ggml_time_us() - t0_tlse; }
+                    // Greedy acceptance: accept if argmax(target) == draft token
+                    llama_token tgt_tok = (llama_token)(std::max_element(tlogits, tlogits + n_vocab) - tlogits);
+                    t_accept_us += ggml_time_us() - t0_acc;
 
-                    // log(accept_prob) = min(0, tlogits[x] - lse_t - dl[x] + lse_d[ni])
-                    const float log_accept = tlogits[x] - lse_t - dl[x] + draft_lse[ni];
-
-                    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
-                    bool accepted;
-                    if (log_accept >= 0.0f) {
-                        accepted = true; // accept_prob >= 1
-                    } else {
-                        accepted = (uni(rng) < expf(log_accept));
-                    }
-
-                    if (accepted) {
+                    if (tgt_tok == x) {
+                        // Accepted
                         tok = x;
                         n_accepted++;
                         n_gen++;
                         if (llama_vocab_is_eog(vocab_tgt, tok)) goto done;
                         if (!on_token(common_token_to_piece(ctx_tgt, tok))) goto done;
                     } else {
-                        // Rejection: single-pass residual sampling
-                        // p_target(v) = exp(tlogits[v] - lse_t), p_draft(v) = exp(dl[v] - lse_d[ni])
-                        // residual(v) = max(0, p_target(v) - p_draft(v))
-                        // First pass: compute sum of residuals
-                        { int64_t t0_res = ggml_time_us();
-                        float rp_sum = 0.0f;
-                        for (int32_t v = 0; v < n_vocab; v++) {
-                            float p_t = expf(tlogits[v] - lse_t);
-                            float p_d = expf(dl[v] - draft_lse[ni]);
-                            float rv = p_t - p_d;
-                            if (rv > 0.0f) rp_sum += rv;
-                        }
-                        llama_token res_tok;
-                        if (rp_sum > 0.0f) {
-                            float r = uni(rng) * rp_sum;
-                            float cumsum = 0.0f;
-                            for (int32_t v = 0; v < n_vocab; v++) {
-                                float p_t = expf(tlogits[v] - lse_t);
-                                float p_d = expf(dl[v] - draft_lse[ni]);
-                                float rv = p_t - p_d;
-                                if (rv > 0.0f) {
-                                    cumsum += rv;
-                                    if (cumsum >= r) { res_tok = v; break; }
-                                }
-                            }
-                        } else {
-                            res_tok = (llama_token)(std::max_element(tlogits, tlogits + n_vocab) - tlogits);
-                        }
+                        // Rejected: use target argmax as corrected token
+                        tok = tgt_tok;
 
                         // Extract hidden states → project → append to ctx_proj
                         const int32_t n_ctx_new = 1 + ni;
@@ -608,6 +580,7 @@ struct DFlashEngine {
                                                              proj_scratch.data(), n_ctx_new);
                             t_project_us += ggml_time_us() - t0;
                             if (proj_ok2) {
+                                int64_t t0_cp = ggml_time_us();
                                 ctx_proj.resize((size_t)(n_ctx + n_ctx_new) * n_embd);
                                 memcpy(ctx_proj.data() + (size_t)n_ctx * n_embd,
                                        proj_scratch.data(), (size_t)n_ctx_new * n_embd * sizeof(float));
@@ -619,41 +592,49 @@ struct DFlashEngine {
                                     ctx_proj.resize((size_t)max_ctx_window * n_embd);
                                     n_ctx = max_ctx_window;
                                 }
+                                t_ctxproj_us += ggml_time_us() - t0_cp;
                             }
                         }
 
-                        tok = res_tok;
-                        t_residual_us += ggml_time_us() - t0_res; }
                         n_gen++;
                         if (llama_vocab_is_eog(vocab_tgt, tok)) goto done;
                         if (!on_token(common_token_to_piece(ctx_tgt, tok))) goto done;
 
                         // Crop KV cache
-                        if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0,
-                                                 n_past_before_vb + 1 + ni, -1)) {
-                            GGML_ASSERT(use_recr_snap && recr_snap_written > 0);
-                            int64_t t0_rsnap = ggml_time_us();
-                            llama_set_hidden_capture_layers(ctx_tgt, nullptr, 0);
-                            llama_state_seq_set_data_ext(ctx_tgt, recr_snap.data(),
-                                    recr_snap_written, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_before_vb, -1);
-                            const int n_replay = 1 + ni;
-                            llama_batch rb = llama_batch_init(n_replay, 0, 1);
-                            rb.n_tokens = 0;
-                            common_batch_add(rb, tok_vb, (llama_pos)n_past_before_vb, {0}, false);
-                            for (int32_t ri = 0; ri < ni; ri++)
-                                common_batch_add(rb, candidates[ri],
-                                                 (llama_pos)(n_past_before_vb + 1 + ri), {0}, false);
-                            if (llama_decode(ctx_tgt, rb) != 0) {
-                                llama_batch_free(rb); ok = false;
+                        {
+                            int64_t t0_kvc = ggml_time_us();
+                            bool crop_ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0,
+                                                     n_past_before_vb + 1 + ni, -1);
+                            t_kv_crop_us += ggml_time_us() - t0_kvc;
+                            if (!crop_ok) {
+                                GGML_ASSERT(use_recr_snap && (gpu_snap || recr_snap_written > 0));
+                                int64_t t0_rsnap = ggml_time_us();
+                                llama_set_hidden_capture_layers(ctx_tgt, nullptr, 0);
+                                if (gpu_snap) {
+                                    llama_gpu_snapshot_restore(ctx_tgt, gpu_snap, 0,
+                                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                } else {
+                                    llama_state_seq_set_data_ext(ctx_tgt, recr_snap.data(),
+                                            recr_snap_written, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                }
+                                llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_before_vb, -1);
+                                const int n_replay = 1 + ni;
+                                llama_batch rb = llama_batch_init(n_replay, 0, 1);
+                                rb.n_tokens = 0;
+                                common_batch_add(rb, tok_vb, (llama_pos)n_past_before_vb, {0}, false);
+                                for (int32_t ri = 0; ri < ni; ri++)
+                                    common_batch_add(rb, candidates[ri],
+                                                     (llama_pos)(n_past_before_vb + 1 + ri), {0}, false);
+                                if (llama_decode(ctx_tgt, rb) != 0) {
+                                    llama_batch_free(rb); ok = false;
+                                }
+                                llama_batch_free(rb);
+                                t_snap_restore_us += ggml_time_us() - t0_rsnap;
                             }
-                            llama_batch_free(rb);
-                            t_snap_restore_us += ggml_time_us() - t0_rsnap;
                         }
 
                         n_past   = n_past_before_vb + 1 + n_accepted;
                         rejected = true;
-                        if (llama_vocab_is_eog(vocab_tgt, tok)) goto done;
                         break;
                     }
                 }
@@ -684,6 +665,7 @@ struct DFlashEngine {
                                                          proj_scratch.data(), n_ctx_new);
                         t_project_us += ggml_time_us() - t0;
                         if (proj_ok3) {
+                            int64_t t0_cp2 = ggml_time_us();
                             ctx_proj.resize((size_t)(n_ctx + n_ctx_new) * n_embd);
                             memcpy(ctx_proj.data() + (size_t)n_ctx * n_embd,
                                    proj_scratch.data(), (size_t)n_ctx_new * n_embd * sizeof(float));
@@ -695,13 +677,16 @@ struct DFlashEngine {
                                 ctx_proj.resize((size_t)max_ctx_window * n_embd);
                                 n_ctx = max_ctx_window;
                             }
+                            t_ctxproj_us += ggml_time_us() - t0_cp2;
                         }
                     }
                     if (!ok) break;
 
                     if (n_gen < max_tokens) {
+                        int64_t t0_smp = ggml_time_us();
                         tok = common_sampler_sample(smpl_tgt, ctx_tgt, n_cands);
                         common_sampler_accept(smpl_tgt, tok, true);
+                        t_sampler_us += ggml_time_us() - t0_smp;
                         n_gen++;
                         n_past = n_past_before_vb + 1 + n_cands;
                         if (llama_vocab_is_eog(vocab_tgt, tok)) goto done;
@@ -741,7 +726,8 @@ done:
                 const int64_t t_timed_us = t_draft_us + t_verify_us + t_lmhead_us
                                          + t_project_us + t_snap_save_us + t_snap_restore_us
                                          + t_hidden_extract_us
-                                         + t_tgt_lse_us + t_residual_us;
+                                         + t_noise_build_us + t_batch_build_us + t_embd_collect_us
+                                         + t_accept_us + t_ctxproj_us + t_kv_crop_us + t_sampler_us;
                 const int64_t t_other_us = t_decode_us - t_timed_us;
                 const int32_t n_gen = res.n_generated;
 
@@ -771,11 +757,22 @@ done:
                 }
                 fprintf(stderr, "    hidden extr   = %8.2f ms/iter  (%5.1f%%)\n",
                         t_hidden_extract_us * 1e-3 / iters, 100.0 * t_hidden_extract_us / t_decode_us);
-                fprintf(stderr, "    target lse    = %8.2f ms/iter  (%5.1f%%)\n",
-                        t_tgt_lse_us * 1e-3 / iters, 100.0 * t_tgt_lse_us / t_decode_us);
-                fprintf(stderr, "    residual smp  = %8.2f ms/iter  (%5.1f%%)\n",
-                        t_residual_us * 1e-3 / iters, 100.0 * t_residual_us / t_decode_us);
-                fprintf(stderr, "    other         = %8.2f ms/iter  (%5.1f%%)\n",
+                fprintf(stderr, "    --- other breakdown ---\n");
+                fprintf(stderr, "    noise build   = %8.2f ms/iter  (%5.1f%%)\n",
+                        t_noise_build_us * 1e-3 / iters, 100.0 * t_noise_build_us / t_decode_us);
+                fprintf(stderr, "    batch bld/free= %8.2f ms/iter  (%5.1f%%)\n",
+                        t_batch_build_us * 1e-3 / iters, 100.0 * t_batch_build_us / t_decode_us);
+                fprintf(stderr, "    embd collect  = %8.2f ms/iter  (%5.1f%%)\n",
+                        t_embd_collect_us * 1e-3 / iters, 100.0 * t_embd_collect_us / t_decode_us);
+                fprintf(stderr, "    accept argmax = %8.2f ms/iter  (%5.1f%%)\n",
+                        t_accept_us * 1e-3 / iters, 100.0 * t_accept_us / t_decode_us);
+                fprintf(stderr, "    ctx_proj mgmt = %8.2f ms/iter  (%5.1f%%)\n",
+                        t_ctxproj_us * 1e-3 / iters, 100.0 * t_ctxproj_us / t_decode_us);
+                fprintf(stderr, "    kv crop       = %8.2f ms/iter  (%5.1f%%)\n",
+                        t_kv_crop_us * 1e-3 / iters, 100.0 * t_kv_crop_us / t_decode_us);
+                fprintf(stderr, "    sampler       = %8.2f ms/iter  (%5.1f%%)\n",
+                        t_sampler_us * 1e-3 / iters, 100.0 * t_sampler_us / t_decode_us);
+                fprintf(stderr, "    residual      = %8.2f ms/iter  (%5.1f%%)\n",
                         t_other_us * 1e-3 / iters, 100.0 * t_other_us / t_decode_us);
 
                 fprintf(stderr, "  \n");
@@ -792,6 +789,7 @@ done:
     }
 
     ~DFlashEngine() {
+        if (gpu_snap) llama_gpu_snapshot_free(ctx_tgt, gpu_snap);
         if (smpl_tgt) common_sampler_free(smpl_tgt);
         llama_lm_head_gpu_free(lmh_gpu);
         llama_dflash_proj_gpu_free(proj_gpu);

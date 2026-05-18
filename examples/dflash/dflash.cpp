@@ -270,19 +270,25 @@ int main(int argc, char ** argv) {
     //   - pure-attention: PARTIAL_ONLY == full state → sz_recr == sz_full (large, grows)
     // Only save snapshots for hybrid models; pure-attention models never need them.
     bool use_recr_snap = false;
-    size_t recr_snap_size = 0;   // cached (fixed for hybrid, 0 for pure-attention)
+    llama_gpu_snapshot * gpu_snap = nullptr;
+    size_t recr_snap_size = 0;
     std::vector<uint8_t> recr_snap;
     size_t recr_snap_written = 0;
-    llama_token tok_vb = LLAMA_TOKEN_NULL;  // tok at start of current verification batch
+    llama_token tok_vb = LLAMA_TOKEN_NULL;
     if (!no_draft) {
         const size_t sz_full = llama_state_seq_get_size(ctx_tgt, 0);
         const size_t sz_recr = llama_state_seq_get_size_ext(ctx_tgt, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         use_recr_snap = (sz_full > 0 && sz_recr < sz_full);
         if (use_recr_snap) {
-            recr_snap_size = sz_recr;
-            recr_snap.resize(sz_recr);
-            fprintf(stderr, "%s: hybrid model — recurrent snapshot enabled (recr=%zu full=%zu)\n",
-                    __func__, sz_recr, sz_full);
+            gpu_snap = llama_gpu_snapshot_create(ctx_tgt);
+            if (gpu_snap) {
+                fprintf(stderr, "%s: hybrid model — GPU snapshot enabled\n", __func__);
+            } else {
+                recr_snap_size = sz_recr;
+                recr_snap.resize(sz_recr);
+                fprintf(stderr, "%s: hybrid model — CPU snapshot fallback (recr=%zu full=%zu)\n",
+                        __func__, sz_recr, sz_full);
+            }
         }
     }
 
@@ -449,26 +455,35 @@ int main(int argc, char ** argv) {
         llama_set_embeddings(ctx_dft, false);
         if (!ok) break;
 
-        // Apply target lm_head to draft embeddings
+        // Apply target lm_head to draft embeddings → greedy argmax
         {
             bool lmh_ok;
+            const bool need_logits = (n_gen == 1 && getenv("DFLASH_DUMP_DRAFT_LOGITS"));
             const int64_t t0_lmh = ggml_time_us();
-            if (lmh_gpu) {
+            if (lmh_gpu && !need_logits) {
+                lmh_ok = llama_lm_head_gpu_apply_argmax(lmh_gpu, draft_embd.data(), candidates.data(), n_cands);
+            } else if (lmh_gpu) {
                 lmh_ok = llama_lm_head_gpu_apply(lmh_gpu, draft_embd.data(), draft_logits.data(), n_cands);
+                if (lmh_ok) {
+                    for (int32_t ni = 0; ni < n_cands; ni++) {
+                        const float * lg = draft_logits.data() + (size_t)ni * n_vocab;
+                        candidates[ni] = (llama_token)(std::max_element(lg, lg + n_vocab) - lg);
+                    }
+                }
             } else {
                 lmh_ok = llama_model_apply_lm_head(model_tgt, draft_embd.data(), draft_logits.data(), n_cands, false);
+                if (lmh_ok) {
+                    for (int32_t ni = 0; ni < n_cands; ni++) {
+                        const float * lg = draft_logits.data() + (size_t)ni * n_vocab;
+                        candidates[ni] = (llama_token)(std::max_element(lg, lg + n_vocab) - lg);
+                    }
+                }
             }
             t_lmhead_us += ggml_time_us() - t0_lmh;
             if (!lmh_ok) {
                 fprintf(stderr, "\n%s: lm_head failed\n", __func__);
                 break;
             }
-        }
-
-        // Sample candidates (greedy)
-        for (int32_t ni = 0; ni < n_cands; ni++) {
-            const float * logits_ni = draft_logits.data() + (size_t)ni * n_vocab;
-            candidates[ni] = std::max_element(logits_ni, logits_ni + n_vocab) - logits_ni;
         }
 
         // Dump first-iteration draft logits for debugging (if requested)
@@ -506,12 +521,15 @@ int main(int argc, char ** argv) {
         // On rejection at ni: crop KV cache (pure-attention: seq_rm; hybrid: snapshot/replay).
 
         // Save recurrent-only snapshot before verification (hybrid models only).
-        // For hybrid models: PARTIAL_ONLY → only recurrent state (fixed small size).
-        // Pure-attention models: seq_rm always succeeds, no snapshot needed.
         if (use_recr_snap) {
-            recr_snap_written = llama_state_seq_get_data_ext(
-                    ctx_tgt, recr_snap.data(), recr_snap_size, 0,
-                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (gpu_snap) {
+                llama_gpu_snapshot_save(ctx_tgt, gpu_snap, 0,
+                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            } else {
+                recr_snap_written = llama_state_seq_get_data_ext(
+                        ctx_tgt, recr_snap.data(), recr_snap_size, 0,
+                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
             tok_vb = tok;
         }
         llama_set_hidden_capture_layers(ctx_tgt, tgt_layer_ids.data(), n_tgt_lyrs);
@@ -638,14 +656,16 @@ int main(int argc, char ** argv) {
                 // because llama_memory_recurrent::seq_rm returns false for partial tail crops.
                 // Fix: restore recurrent state (PARTIAL_ONLY, O(1)) → seq_rm attention KV → replay.
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_before_vb + 1 + ni, -1)) {
-                    GGML_ASSERT(use_recr_snap && recr_snap_written > 0 &&
+                    GGML_ASSERT(use_recr_snap && (gpu_snap || recr_snap_written > 0) &&
                                 "seq_rm failed but no snapshot was saved — unexpected state");
-                    // Turn off hidden capture before replay (we already extracted what we need)
                     llama_set_hidden_capture_layers(ctx_tgt, nullptr, 0);
-                    // 1. Restore recurrent state to before the verification batch.
-                    //    This moves the recurrent tail back to n_past_before_vb-1.
-                    llama_state_seq_set_data_ext(ctx_tgt, recr_snap.data(), recr_snap_written, 0,
-                                                 LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (gpu_snap) {
+                        llama_gpu_snapshot_restore(ctx_tgt, gpu_snap, 0,
+                                                   LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    } else {
+                        llama_state_seq_set_data_ext(ctx_tgt, recr_snap.data(), recr_snap_written, 0,
+                                                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
                     // 2. Trim attention KV: remove all verification batch tokens.
                     //    Now safe: recurrent tail < n_past_before_vb, so seq_rm succeeds.
                     llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_before_vb, -1);
@@ -762,6 +782,7 @@ done:
         }
     }
 
+    if (gpu_snap) llama_gpu_snapshot_free(ctx_tgt, gpu_snap);
     common_sampler_free(smpl_tgt);
     llama_lm_head_gpu_free(lmh_gpu);
     llama_dflash_proj_gpu_free(proj_gpu);

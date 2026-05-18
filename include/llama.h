@@ -664,6 +664,14 @@ extern "C" {
         const float              * embd,    // host float [n_batch, n_embd]
               float              * logits,  // host float [n_batch, n_vocab]  (caller allocates)
               int32_t              n_tokens); // must be <= n_batch
+    // Like llama_lm_head_gpu_apply, but only downloads the per-row argmax
+    // (n_tokens ints) instead of the full logits matrix.
+    // Use when only greedy token IDs are needed — avoids a large GPU→CPU transfer.
+    LLAMA_API bool llama_lm_head_gpu_apply_argmax(
+        struct llama_lm_head_gpu * lmh,
+        const float              * embd,       // host float [n_batch, n_embd]
+              int32_t            * argmax_out, // host int32 [n_batch]  — GPU-computed argmax index per row
+              int32_t              n_tokens);    // must be <= n_batch
     // Like llama_lm_head_gpu_apply, but also computes per-row LSE (log-sum-exp)
     // and argmax on GPU, avoiding a costly CPU exp() loop over n_vocab.
     LLAMA_API bool llama_lm_head_gpu_apply_lse(
@@ -986,6 +994,25 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // GPU-direct snapshot: fast save/restore of recurrent state without CPU round-trip.
+    // Returns nullptr if the context's memory does not support GPU snapshots.
+    struct llama_gpu_snapshot;
+    LLAMA_API struct llama_gpu_snapshot * llama_gpu_snapshot_create(
+            struct llama_context * ctx);
+    LLAMA_API bool llama_gpu_snapshot_save(
+            struct llama_context    * ctx,
+            struct llama_gpu_snapshot * snap,
+                      llama_seq_id   seq_id,
+             llama_state_seq_flags   flags);
+    LLAMA_API bool llama_gpu_snapshot_restore(
+            struct llama_context          * ctx,
+            const struct llama_gpu_snapshot * snap,
+                            llama_seq_id   seq_id,
+                   llama_state_seq_flags   flags);
+    LLAMA_API void llama_gpu_snapshot_free(
+            struct llama_context    * ctx,
+            struct llama_gpu_snapshot * snap);
 
     //
     // Decoding

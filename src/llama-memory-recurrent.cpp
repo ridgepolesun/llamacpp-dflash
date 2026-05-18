@@ -1082,6 +1082,127 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 }
 
 //
+// GPU-direct snapshot
+//
+
+struct llama_memory_i::gpu_snapshot {
+    std::vector<ggml_tensor *> r_snap;
+    std::vector<ggml_tensor *> s_snap;
+    ggml_context * ctx_ggml = nullptr;
+    std::vector<ggml_backend_buffer_t> bufs;
+    // direct cell-state backup — avoids seq_rm/find_slot side-effects on restore
+    std::vector<llama_memory_recurrent::mem_cell> saved_cells;
+    uint32_t saved_head  = 0;
+    uint32_t saved_used  = 0;
+    uint32_t saved_n     = 0;
+    int32_t  saved_rs_z  = -1;
+};
+
+llama_memory_i::gpu_snapshot * llama_memory_recurrent::gpu_snapshot_create() const {
+    const uint32_t n_layer = hparams.n_layer;
+
+    ggml_init_params params = {
+        size_t(2u * n_layer * ggml_tensor_overhead()),
+        nullptr,
+        true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return nullptr;
+
+    auto * snap = new gpu_snapshot();
+    snap->ctx_ggml = ctx;
+    snap->r_snap.resize(n_layer, nullptr);
+    snap->s_snap.resize(n_layer, nullptr);
+
+    for (uint32_t il = 0; il < n_layer; il++) {
+        if (r_l[il]) {
+            ggml_tensor * t = ggml_dup_tensor(ctx, r_l[il]);
+            ggml_format_name(t, "snap_r_l%d", il);
+            snap->r_snap[il] = t;
+        }
+        if (s_l[il]) {
+            ggml_tensor * t = ggml_dup_tensor(ctx, s_l[il]);
+            ggml_format_name(t, "snap_s_l%d", il);
+            snap->s_snap[il] = t;
+        }
+    }
+
+    // Use CPU buffer for snapshot tensors — avoids CUDA stream sync issues
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    if (!buf) {
+        gpu_snapshot_free(snap);
+        return nullptr;
+    }
+    ggml_backend_buffer_clear(buf, 0);
+    snap->bufs.push_back(buf);
+
+    return snap;
+}
+
+bool llama_memory_recurrent::gpu_snapshot_save(gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(flags);
+    if (!snap) return false;
+
+    // Save cell metadata directly — avoids seq_rm/find_slot side-effects on restore
+    snap->saved_cells = cells;
+    snap->saved_head  = head;
+    snap->saved_used  = used;
+    snap->saved_n     = n;
+    snap->saved_rs_z  = rs_z;
+
+    // Save tensor data (GPU→CPU)
+    const uint32_t n_layer = hparams.n_layer;
+    for (uint32_t il = 0; il < n_layer; il++) {
+        if (r_l[il] && snap->r_snap[il]) {
+            ggml_backend_tensor_get(r_l[il], snap->r_snap[il]->data, 0, ggml_nbytes(r_l[il]));
+        }
+        if (s_l[il] && snap->s_snap[il]) {
+            ggml_backend_tensor_get(s_l[il], snap->s_snap[il]->data, 0, ggml_nbytes(s_l[il]));
+        }
+    }
+    return true;
+}
+
+bool llama_memory_recurrent::gpu_snapshot_restore(const gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(flags);
+    if (!snap || snap->saved_cells.empty()) return false;
+    GGML_ASSERT(snap->saved_cells.size() == cells.size());
+
+    // Restore cell metadata directly — no seq_rm/find_slot, so rs_z stays -1
+    // and src0 correctly points to existing data rather than the zero state.
+    cells = snap->saved_cells;
+    head  = snap->saved_head;
+    used  = snap->saved_used;
+    n     = snap->saved_n;
+    rs_z  = snap->saved_rs_z;
+
+    // Restore tensor data (CPU→GPU)
+    const uint32_t n_layer = hparams.n_layer;
+    for (uint32_t il = 0; il < n_layer; il++) {
+        if (snap->r_snap[il] && r_l[il]) {
+            ggml_backend_tensor_set(r_l[il], snap->r_snap[il]->data, 0, ggml_nbytes(r_l[il]));
+        }
+        if (snap->s_snap[il] && s_l[il]) {
+            ggml_backend_tensor_set(s_l[il], snap->s_snap[il]->data, 0, ggml_nbytes(s_l[il]));
+        }
+    }
+    return true;
+}
+
+void llama_memory_recurrent::gpu_snapshot_free(gpu_snapshot * snap) const {
+    if (!snap) return;
+    for (auto * buf : snap->bufs) {
+        ggml_backend_buffer_free(buf);
+    }
+    if (snap->ctx_ggml) {
+        ggml_free(snap->ctx_ggml);
+    }
+    delete snap;
+}
+
+//
 // llama_memory_recurrent_context
 //
 

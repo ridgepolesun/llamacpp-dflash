@@ -9609,6 +9609,30 @@ bool llama_lm_head_gpu_apply(llama_lm_head_gpu * lmh,
     return true;
 }
 
+bool llama_lm_head_gpu_apply_argmax(llama_lm_head_gpu * lmh,
+                                     const float       * embd,
+                                           int32_t     * argmax_out,
+                                           int32_t       n_tokens) {
+    if (!lmh || !lmh->ok) return false;
+    if (n_tokens > lmh->n_batch) return false;
+
+    const size_t used_embd    = (size_t)n_tokens     * lmh->n_embd * sizeof(float);
+    const size_t total_embd   = (size_t)lmh->n_batch * lmh->n_embd * sizeof(float);
+
+    ggml_backend_tensor_set(lmh->inp_embd, embd, 0, used_embd);
+    if (used_embd < total_embd) {
+        ggml_backend_tensor_memset(lmh->inp_embd, 0, used_embd, total_embd - used_embd);
+    }
+
+    if (ggml_backend_graph_compute(lmh->backend, lmh->gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    ggml_backend_tensor_get(lmh->out_argmax, argmax_out, 0,
+                            (size_t)n_tokens * sizeof(int32_t));
+    return true;
+}
+
 bool llama_lm_head_gpu_apply_lse(llama_lm_head_gpu * lmh,
                                   const float       * embd,
                                         float       * logits,

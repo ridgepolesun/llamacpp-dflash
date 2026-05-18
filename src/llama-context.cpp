@@ -3452,6 +3452,36 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     return ctx->state_seq_set_data(seq_id, src, size, flags);
 }
 
+llama_gpu_snapshot * llama_gpu_snapshot_create(llama_context * ctx) {
+    ctx->synchronize();
+    auto * memory = llama_get_memory(ctx);
+    if (!memory) return nullptr;
+    return reinterpret_cast<llama_gpu_snapshot *>(memory->gpu_snapshot_create());
+}
+
+bool llama_gpu_snapshot_save(llama_context * ctx, llama_gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (!snap) return false;
+    ctx->synchronize();
+    auto * memory = llama_get_memory(ctx);
+    if (!memory) return false;
+    return memory->gpu_snapshot_save(reinterpret_cast<llama_memory_i::gpu_snapshot *>(snap), seq_id, flags);
+}
+
+bool llama_gpu_snapshot_restore(llama_context * ctx, const llama_gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (!snap) return false;
+    ctx->synchronize();
+    auto * memory = llama_get_memory(ctx);
+    if (!memory) return false;
+    return memory->gpu_snapshot_restore(reinterpret_cast<const llama_memory_i::gpu_snapshot *>(snap), seq_id, flags);
+}
+
+void llama_gpu_snapshot_free(llama_context * ctx, llama_gpu_snapshot * snap) {
+    if (!snap) return;
+    auto * memory = llama_get_memory(ctx);
+    if (!memory) return;
+    memory->gpu_snapshot_free(reinterpret_cast<llama_memory_i::gpu_snapshot *>(snap));
+}
+
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
     ctx->synchronize();
 

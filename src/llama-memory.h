@@ -117,6 +117,21 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // GPU-direct snapshot (optional, for fast save/restore without CPU round-trip)
+    //
+
+    struct gpu_snapshot;
+
+    virtual gpu_snapshot * gpu_snapshot_create() const { return nullptr; }
+    virtual bool gpu_snapshot_save   (gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+        GGML_UNUSED(snap); GGML_UNUSED(seq_id); GGML_UNUSED(flags); return false;
+    }
+    virtual bool gpu_snapshot_restore(const gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) {
+        GGML_UNUSED(snap); GGML_UNUSED(seq_id); GGML_UNUSED(flags); return false;
+    }
+    virtual void gpu_snapshot_free   (gpu_snapshot * snap) const { GGML_UNUSED(snap); }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
