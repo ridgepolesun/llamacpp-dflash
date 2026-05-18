@@ -929,6 +929,18 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
         common_chat_templates_inputs inputs;
         inputs.messages              = msgs;
         inputs.add_generation_prompt = true;
+
+        // Support chat_template_kwargs.enable_thinking (same as llama-server)
+        if (body.contains("chat_template_kwargs")) {
+            auto kwargs = body["chat_template_kwargs"];
+            if (kwargs.contains("enable_thinking")) {
+                auto val = kwargs["enable_thinking"];
+                if (val.is_boolean()) {
+                    inputs.enable_thinking = val.get<bool>();
+                }
+            }
+        }
+
         auto chat_params = common_chat_templates_apply(tmpls.get(), inputs);
         prompt = chat_params.prompt;
     }

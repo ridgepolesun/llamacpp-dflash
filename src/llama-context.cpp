@@ -3459,20 +3459,32 @@ llama_gpu_snapshot * llama_gpu_snapshot_create(llama_context * ctx) {
     return reinterpret_cast<llama_gpu_snapshot *>(memory->gpu_snapshot_create());
 }
 
+static ggml_backend_t llama_find_gpu_backend(llama_context * ctx) {
+    auto * sched = ctx->get_sched();
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); i++) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+        ggml_backend_dev_t dev = ggml_backend_get_device(b);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return b;
+        }
+    }
+    return nullptr;
+}
+
 bool llama_gpu_snapshot_save(llama_context * ctx, llama_gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (!snap) return false;
-    ctx->synchronize();
     auto * memory = llama_get_memory(ctx);
     if (!memory) return false;
-    return memory->gpu_snapshot_save(reinterpret_cast<llama_memory_i::gpu_snapshot *>(snap), seq_id, flags);
+    ggml_backend_t gpu = llama_find_gpu_backend(ctx);
+    return memory->gpu_snapshot_save(reinterpret_cast<llama_memory_i::gpu_snapshot *>(snap), seq_id, flags, gpu);
 }
 
 bool llama_gpu_snapshot_restore(llama_context * ctx, const llama_gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (!snap) return false;
-    ctx->synchronize();
     auto * memory = llama_get_memory(ctx);
     if (!memory) return false;
-    return memory->gpu_snapshot_restore(reinterpret_cast<const llama_memory_i::gpu_snapshot *>(snap), seq_id, flags);
+    ggml_backend_t gpu = llama_find_gpu_backend(ctx);
+    return memory->gpu_snapshot_restore(reinterpret_cast<const llama_memory_i::gpu_snapshot *>(snap), seq_id, flags, gpu);
 }
 
 void llama_gpu_snapshot_free(llama_context * ctx, llama_gpu_snapshot * snap) {

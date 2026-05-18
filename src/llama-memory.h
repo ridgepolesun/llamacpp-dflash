@@ -125,11 +125,11 @@ struct llama_memory_i {
     struct gpu_snapshot;
 
     virtual gpu_snapshot * gpu_snapshot_create() const { return nullptr; }
-    virtual bool gpu_snapshot_save   (gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-        GGML_UNUSED(snap); GGML_UNUSED(seq_id); GGML_UNUSED(flags); return false;
+    virtual bool gpu_snapshot_save   (gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags, ggml_backend_t backend = nullptr) const {
+        GGML_UNUSED(snap); GGML_UNUSED(seq_id); GGML_UNUSED(flags); GGML_UNUSED(backend); return false;
     }
-    virtual bool gpu_snapshot_restore(const gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) {
-        GGML_UNUSED(snap); GGML_UNUSED(seq_id); GGML_UNUSED(flags); return false;
+    virtual bool gpu_snapshot_restore(const gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags, ggml_backend_t backend = nullptr) {
+        GGML_UNUSED(snap); GGML_UNUSED(seq_id); GGML_UNUSED(flags); GGML_UNUSED(backend); return false;
     }
     virtual void gpu_snapshot_free   (gpu_snapshot * snap) const { GGML_UNUSED(snap); }
 };

@@ -1088,7 +1088,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 struct llama_memory_i::gpu_snapshot {
     std::vector<ggml_tensor *> r_snap;
     std::vector<ggml_tensor *> s_snap;
-    ggml_context * ctx_ggml = nullptr;
+    std::vector<ggml_context *> ctxs;  // one per backend buffer type
     std::vector<ggml_backend_buffer_t> bufs;
     // direct cell-state backup — avoids seq_rm/find_slot side-effects on restore
     std::vector<llama_memory_recurrent::mem_cell> saved_cells;
@@ -1101,45 +1101,61 @@ struct llama_memory_i::gpu_snapshot {
 llama_memory_i::gpu_snapshot * llama_memory_recurrent::gpu_snapshot_create() const {
     const uint32_t n_layer = hparams.n_layer;
 
-    ggml_init_params params = {
-        size_t(2u * n_layer * ggml_tensor_overhead()),
-        nullptr,
-        true,
+    struct ggml_backend_buft_comparator {
+        bool operator()(ggml_backend_buffer_type_t lhs, ggml_backend_buffer_type_t rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
     };
-    ggml_context * ctx = ggml_init(params);
-    if (!ctx) return nullptr;
+    std::map<ggml_backend_buffer_type_t, ggml_context *, ggml_backend_buft_comparator> ctx_map;
+
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it != ctx_map.end()) return it->second;
+        ggml_init_params p = { size_t(2u * n_layer * ggml_tensor_overhead()), nullptr, true };
+        ggml_context * ctx = ggml_init(p);
+        if (!ctx) return nullptr;
+        ctx_map.emplace(buft, ctx);
+        return ctx;
+    };
 
     auto * snap = new gpu_snapshot();
-    snap->ctx_ggml = ctx;
     snap->r_snap.resize(n_layer, nullptr);
     snap->s_snap.resize(n_layer, nullptr);
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (r_l[il]) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(r_l[il]->buffer);
+            ggml_context * ctx = ctx_for_buft(buft);
+            if (!ctx) { gpu_snapshot_free(snap); return nullptr; }
             ggml_tensor * t = ggml_dup_tensor(ctx, r_l[il]);
             ggml_format_name(t, "snap_r_l%d", il);
             snap->r_snap[il] = t;
         }
         if (s_l[il]) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(s_l[il]->buffer);
+            ggml_context * ctx = ctx_for_buft(buft);
+            if (!ctx) { gpu_snapshot_free(snap); return nullptr; }
             ggml_tensor * t = ggml_dup_tensor(ctx, s_l[il]);
             ggml_format_name(t, "snap_s_l%d", il);
             snap->s_snap[il] = t;
         }
     }
 
-    // Use CPU buffer for snapshot tensors — avoids CUDA stream sync issues
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
-    if (!buf) {
-        gpu_snapshot_free(snap);
-        return nullptr;
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (!buf) {
+            for (auto & [b, c] : ctx_map) ggml_free(c);
+            delete snap;
+            return nullptr;
+        }
+        snap->bufs.push_back(buf);
+        snap->ctxs.push_back(ctx);
     }
-    ggml_backend_buffer_clear(buf, 0);
-    snap->bufs.push_back(buf);
 
     return snap;
 }
 
-bool llama_memory_recurrent::gpu_snapshot_save(gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+bool llama_memory_recurrent::gpu_snapshot_save(gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags, ggml_backend_t backend) const {
     GGML_UNUSED(seq_id);
     GGML_UNUSED(flags);
     if (!snap) return false;
@@ -1151,20 +1167,42 @@ bool llama_memory_recurrent::gpu_snapshot_save(gpu_snapshot * snap, llama_seq_id
     snap->saved_n     = n;
     snap->saved_rs_z  = rs_z;
 
-    // Save tensor data (GPU→CPU)
-    const uint32_t n_layer = hparams.n_layer;
-    for (uint32_t il = 0; il < n_layer; il++) {
-        if (r_l[il] && snap->r_snap[il]) {
-            ggml_backend_tensor_get(r_l[il], snap->r_snap[il]->data, 0, ggml_nbytes(r_l[il]));
+    if (backend && snap->bufs.size() == ctxs_bufs.size()) {
+        // Bulk async D2D copy per buffer — single API call on the compute stream.
+        // The compute stream guarantees ordering: previous decode writes complete
+        // before the copy, and the copy completes before the next decode reads.
+        for (size_t bi = 0; bi < ctxs_bufs.size(); bi++) {
+            ggml_backend_buffer_t src_buf  = ctxs_bufs[bi].second.get();
+            ggml_backend_buffer_t snap_buf = snap->bufs[bi];
+            size_t buf_size = ggml_backend_buffer_get_size(src_buf);
+            GGML_ASSERT(buf_size == ggml_backend_buffer_get_size(snap_buf));
+
+            ggml_tensor fake_src = {};
+            fake_src.type  = GGML_TYPE_I8;
+            fake_src.ne[0] = (int64_t)buf_size; fake_src.ne[1] = 1; fake_src.ne[2] = 1; fake_src.ne[3] = 1;
+            fake_src.nb[0] = 1; fake_src.nb[1] = buf_size; fake_src.nb[2] = buf_size; fake_src.nb[3] = buf_size;
+            fake_src.data   = ggml_backend_buffer_get_base(src_buf);
+            fake_src.buffer = src_buf;
+
+            ggml_tensor fake_dst = fake_src;
+            fake_dst.data   = ggml_backend_buffer_get_base(snap_buf);
+            fake_dst.buffer = snap_buf;
+
+            ggml_backend_tensor_copy_async(backend, backend, &fake_src, &fake_dst);
         }
-        if (s_l[il] && snap->s_snap[il]) {
-            ggml_backend_tensor_get(s_l[il], snap->s_snap[il]->data, 0, ggml_nbytes(s_l[il]));
+    } else {
+        const uint32_t n_layer = hparams.n_layer;
+        for (uint32_t il = 0; il < n_layer; il++) {
+            if (r_l[il] && snap->r_snap[il])
+                ggml_backend_tensor_copy(r_l[il], snap->r_snap[il]);
+            if (s_l[il] && snap->s_snap[il])
+                ggml_backend_tensor_copy(s_l[il], snap->s_snap[il]);
         }
     }
     return true;
 }
 
-bool llama_memory_recurrent::gpu_snapshot_restore(const gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) {
+bool llama_memory_recurrent::gpu_snapshot_restore(const gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags, ggml_backend_t backend) {
     GGML_UNUSED(seq_id);
     GGML_UNUSED(flags);
     if (!snap || snap->saved_cells.empty()) return false;
@@ -1178,14 +1216,32 @@ bool llama_memory_recurrent::gpu_snapshot_restore(const gpu_snapshot * snap, lla
     n     = snap->saved_n;
     rs_z  = snap->saved_rs_z;
 
-    // Restore tensor data (CPU→GPU)
-    const uint32_t n_layer = hparams.n_layer;
-    for (uint32_t il = 0; il < n_layer; il++) {
-        if (snap->r_snap[il] && r_l[il]) {
-            ggml_backend_tensor_set(r_l[il], snap->r_snap[il]->data, 0, ggml_nbytes(r_l[il]));
+    if (backend && snap->bufs.size() == ctxs_bufs.size()) {
+        for (size_t bi = 0; bi < ctxs_bufs.size(); bi++) {
+            ggml_backend_buffer_t src_buf  = ctxs_bufs[bi].second.get();
+            ggml_backend_buffer_t snap_buf = snap->bufs[bi];
+            size_t buf_size = ggml_backend_buffer_get_size(snap_buf);
+
+            ggml_tensor fake_snap = {};
+            fake_snap.type  = GGML_TYPE_I8;
+            fake_snap.ne[0] = (int64_t)buf_size; fake_snap.ne[1] = 1; fake_snap.ne[2] = 1; fake_snap.ne[3] = 1;
+            fake_snap.nb[0] = 1; fake_snap.nb[1] = buf_size; fake_snap.nb[2] = buf_size; fake_snap.nb[3] = buf_size;
+            fake_snap.data   = ggml_backend_buffer_get_base(snap_buf);
+            fake_snap.buffer = snap_buf;
+
+            ggml_tensor fake_dst = fake_snap;
+            fake_dst.data   = ggml_backend_buffer_get_base(src_buf);
+            fake_dst.buffer = src_buf;
+
+            ggml_backend_tensor_copy_async(backend, backend, &fake_snap, &fake_dst);
         }
-        if (snap->s_snap[il] && s_l[il]) {
-            ggml_backend_tensor_set(s_l[il], snap->s_snap[il]->data, 0, ggml_nbytes(s_l[il]));
+    } else {
+        const uint32_t n_layer = hparams.n_layer;
+        for (uint32_t il = 0; il < n_layer; il++) {
+            if (snap->r_snap[il] && r_l[il])
+                ggml_backend_tensor_copy(snap->r_snap[il], r_l[il]);
+            if (snap->s_snap[il] && s_l[il])
+                ggml_backend_tensor_copy(snap->s_snap[il], s_l[il]);
         }
     }
     return true;
@@ -1196,8 +1252,8 @@ void llama_memory_recurrent::gpu_snapshot_free(gpu_snapshot * snap) const {
     for (auto * buf : snap->bufs) {
         ggml_backend_buffer_free(buf);
     }
-    if (snap->ctx_ggml) {
-        ggml_free(snap->ctx_ggml);
+    for (auto * ctx : snap->ctxs) {
+        ggml_free(ctx);
     }
     delete snap;
 }

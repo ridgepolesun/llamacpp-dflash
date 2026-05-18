@@ -202,12 +202,12 @@ llama_memory_i::gpu_snapshot * llama_memory_hybrid::gpu_snapshot_create() const 
     return mem_recr->gpu_snapshot_create();
 }
 
-bool llama_memory_hybrid::gpu_snapshot_save(gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    return mem_recr->gpu_snapshot_save(snap, seq_id, flags);
+bool llama_memory_hybrid::gpu_snapshot_save(gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags, ggml_backend_t backend) const {
+    return mem_recr->gpu_snapshot_save(snap, seq_id, flags, backend);
 }
 
-bool llama_memory_hybrid::gpu_snapshot_restore(const gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    return mem_recr->gpu_snapshot_restore(snap, seq_id, flags);
+bool llama_memory_hybrid::gpu_snapshot_restore(const gpu_snapshot * snap, llama_seq_id seq_id, llama_state_seq_flags flags, ggml_backend_t backend) {
+    return mem_recr->gpu_snapshot_restore(snap, seq_id, flags, backend);
 }
 
 void llama_memory_hybrid::gpu_snapshot_free(gpu_snapshot * snap) const {
