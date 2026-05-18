@@ -823,6 +823,55 @@ static void handle_health(const httplib::Request &, httplib::Response & res) {
     send_json(res, 200, {{"status", "ok"}});
 }
 
+// ── /tokenize ─────────────────────────────────────────────────────────────────
+
+static void handle_tokenize(const httplib::Request & req, httplib::Response & res) {
+    json body;
+    try { body = json::parse(req.body); } catch (...) { send_err(res, 400, "invalid JSON"); return; }
+
+    if (!body.contains("content") || !body["content"].is_string()) {
+        send_err(res, 400, "missing or invalid \"content\" field"); return;
+    }
+
+    const std::string content    = body["content"].get<std::string>();
+    const bool add_special       = body.value("add_special", false);
+    const bool parse_special     = body.value("parse_special", true);
+    const bool with_pieces       = body.value("with_pieces", false);
+
+    std::vector<llama_token> tokens =
+        common_tokenize(g_engine.ctx_tgt, content, add_special, parse_special);
+
+    json tokens_response = json::array();
+    if (with_pieces) {
+        for (const auto & tok : tokens) {
+            std::string piece = common_token_to_piece(g_engine.ctx_tgt, tok);
+            tokens_response.push_back({{"id", tok}, {"piece", piece}});
+        }
+    } else {
+        tokens_response = tokens;
+    }
+
+    send_json(res, 200, {{"tokens", std::move(tokens_response)}});
+}
+
+// ── /detokenize ───────────────────────────────────────────────────────────────
+
+static void handle_detokenize(const httplib::Request & req, httplib::Response & res) {
+    json body;
+    try { body = json::parse(req.body); } catch (...) { send_err(res, 400, "invalid JSON"); return; }
+
+    if (!body.contains("tokens") || !body["tokens"].is_array()) {
+        send_err(res, 400, "missing or invalid \"tokens\" field"); return;
+    }
+
+    std::string content;
+    for (const auto & tok_j : body["tokens"]) {
+        content += common_token_to_piece(g_engine.ctx_tgt, tok_j.get<llama_token>());
+    }
+
+    send_json(res, 200, {{"content", std::move(content)}});
+}
+
 // ── /completion ───────────────────────────────────────────────────────────────
 
 static void handle_completion(const httplib::Request & req, httplib::Response & res) {
@@ -1114,6 +1163,8 @@ int main(int argc, char ** argv) {
     srv.set_default_headers({{"Access-Control-Allow-Origin", "*"}});
 
     srv.Get ("/health",              handle_health);
+    srv.Post("/tokenize",            handle_tokenize);
+    srv.Post("/detokenize",          handle_detokenize);
     srv.Post("/completion",          handle_completion);
     srv.Post("/v1/chat/completions", handle_chat_completions);
 
