@@ -168,6 +168,14 @@ struct common_speculative_state_draft : public common_speculative_state {
     bool use_ckpt = false;
     struct common_speculative_checkpoint ckpt;
 
+    int64_t t_reuse_us      = 0;
+    int64_t t_ckpt_restore_us = 0;
+    int64_t t_prompt_dec_us = 0;
+    int64_t t_ckpt_save_us  = 0;
+    int64_t t_idlast_dec_us = 0;
+    int64_t t_loop_dec_us   = 0;
+    int64_t t_sample_us     = 0;
+
     common_sampler * smpl;
 
     llama_batch  batch;
@@ -240,16 +248,9 @@ struct common_speculative_state_draft : public common_speculative_state {
     }
 
     void begin(const llama_tokens & prompt) override {
-        if (use_ckpt && ckpt.size() > 0) {
-            // delete checkpoint
-            LOG_DBG("%s: delete checkpoint, prompt.size=%zu, pos_min=%d, pos_max=%d, n_tokens=%" PRId64 ", size=%.3f MiB\n",
-                    __func__, prompt.size(), ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, (float) ckpt.data.size() / 1024 / 1024);
-            ckpt.pos_min   = 0;
-            ckpt.pos_max   = 0;
-            ckpt.n_tokens  = 0;
-            ckpt.ckpt_size = 0;
-            ckpt.data.clear();
-        }
+        // preserve checkpoint for prompt cache reuse across generations
+        // draft() handles stale checkpoints when the prompt changes
+        GGML_UNUSED(prompt);
     }
 
     size_t draft_create_checkpoint(int n_tokens_prompt, int n_tokens_batch) {
@@ -335,6 +336,11 @@ struct common_speculative_state_draft : public common_speculative_state {
 
         const int i_start = std::max<int>(0, (int) prompt_cur.size() - n_ctx);
 
+        bool save_ckpt = false;
+
+        {
+            common_time_meas tm(spec->t_reuse_us);
+
         // reuse as much as possible from the old draft context
         // ideally, the draft context should be as big as the target context and we will always reuse the entire prompt
         for (int i = 0; i < (int) prompt_dft.size(); ++i) {
@@ -353,9 +359,15 @@ struct common_speculative_state_draft : public common_speculative_state {
 
         LOG_DBG("%s: reuse_i = %d, reuse_n = %d, #prompt_dft = %zu, #prompt_cur = %zu\n",
                 __func__, reuse_i, reuse_n, prompt_dft.size(), prompt_cur.size());
-        if (use_ckpt && ckpt.ckpt_size == 0 && reuse_n > 0) {
-            LOG_DBG("%s: no checkpoint available, no reuse, (reuse_i=%d, reuse_n=%d) -> (0, 0)\n",
+        if (use_ckpt && ckpt.ckpt_size == 0 && reuse_n > 0 && reuse_n < (int) prompt_dft.size()) {
+            LOG_DBG("%s: no checkpoint available, cannot truncate, (reuse_i=%d, reuse_n=%d) -> (0, 0)\n",
                     __func__, reuse_i, reuse_n);
+            reuse_i = 0;
+            reuse_n = 0;
+        }
+        if (use_ckpt && ckpt.ckpt_size > 0 && ckpt.n_tokens > (int64_t) reuse_n && reuse_n > 0) {
+            LOG_DBG("%s: checkpoint is stale (ckpt.n_tokens=%" PRId64 " > reuse_n=%d), clearing\n",
+                    __func__, ckpt.n_tokens, reuse_n);
             reuse_i = 0;
             reuse_n = 0;
         }
@@ -363,10 +375,11 @@ struct common_speculative_state_draft : public common_speculative_state {
         result.clear();
         result.reserve(params.n_max);
 
-        bool needs_ckpt = use_ckpt && prompt_dft.size() > 0;
+        save_ckpt = false;
         if (reuse_n == 0 || (use_ckpt && reuse_i > 0)) {
             llama_memory_clear(mem_dft, false);
             prompt_dft.clear();
+            save_ckpt = use_ckpt;
         } else {
             // this happens when a previous draft has been discarded (for example, due to being too small), but the
             // target model agreed with it. in this case, we simply pass back the previous results to save compute
@@ -407,10 +420,12 @@ struct common_speculative_state_draft : public common_speculative_state {
                         LOG_INF("%s: checkpoint is too large, prompt_tgt.size=%zu, ckpt.n_tokens=%" PRId64 ", reuse_n=%d, prompt_dft.size=%zu\n",
                                 __func__, prompt_tgt.size(), ckpt.n_tokens, reuse_n, prompt_dft.size());
                     }
-                    draft_restore_checkpoint(ckpt.ckpt_size);
+                    {
+                        common_time_meas tm2(spec->t_ckpt_restore_us);
+                        draft_restore_checkpoint(ckpt.ckpt_size);
+                    }
                     reuse_n = ckpt.n_tokens;
                     prompt_dft.resize(reuse_n);
-                    needs_ckpt = false;
                 } else {
                     bool is_removed = llama_memory_seq_rm (mem_dft, 0, pos_offset + reuse_n, -1);
                     if (!is_removed) {
@@ -422,9 +437,7 @@ struct common_speculative_state_draft : public common_speculative_state {
             }
         }
 
-        if (needs_ckpt) {
-            ckpt.ckpt_size = draft_create_checkpoint(prompt_dft.size(), batch.n_tokens);
-        }
+        } // end t_reuse_us
 
         // prepare a batch to evaluate any new tokens in the prompt
         common_batch_clear(batch);
@@ -440,11 +453,17 @@ struct common_speculative_state_draft : public common_speculative_state {
         if (batch.n_tokens > 0) {
             //LOG_DBG("%s: draft prompt batch: %s\n", __func__, string_from(ctx, batch).c_str());
 
+            common_time_meas tm(spec->t_prompt_dec_us);
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0 && ret != 1) {
                 LOG_WRN("%s: llama_decode returned %d, prompt_cur.size=%zu\n",
                         __func__, ret, prompt_cur.size());
             }
+        }
+
+        if (use_ckpt && batch.n_tokens > 0 && save_ckpt) {
+            common_time_meas tm(spec->t_ckpt_save_us);
+            ckpt.ckpt_size = draft_create_checkpoint(prompt_dft.size(), 0);
         }
 
         const llama_pos n_past = prompt_dft.size();
@@ -459,6 +478,7 @@ struct common_speculative_state_draft : public common_speculative_state {
         LOG_DBG("%s: draft prompt: %s\n", __func__, string_from(ctx_dft, prompt_dft).c_str());
 
         {
+            common_time_meas tm(spec->t_idlast_dec_us);
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0 && ret != 1) {
                 LOG_WRN("%s: llama_decode returned %d, prompt_cur.size=%zu, prompt_dft.size=%zu\n",
@@ -472,7 +492,10 @@ struct common_speculative_state_draft : public common_speculative_state {
         for (int i = 0; i < params.n_max; ++i) {
             common_batch_clear(batch);
 
-            common_sampler_sample(smpl, ctx_dft, 0, true);
+            {
+                common_time_meas tm(spec->t_sample_us);
+                common_sampler_sample(smpl, ctx_dft, 0, true);
+            }
 
             const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -500,10 +523,13 @@ struct common_speculative_state_draft : public common_speculative_state {
             common_batch_add(batch, id, pos_offset + n_past + i + 1, { 0 }, true);
 
             // evaluate the drafted tokens on the draft model
-            int ret = llama_decode(ctx_dft, batch);
-            if (ret != 0) {
-                LOG_WRN("%s: llama_decode[%d] returned %d, prompt_cur.size=%zu, prompt_dft.size=%zu\n",
-                        __func__, i, ret, prompt_cur.size(), prompt_dft.size());
+            {
+                common_time_meas tm(spec->t_loop_dec_us);
+                int ret = llama_decode(ctx_dft, batch);
+                if (ret != 0) {
+                    LOG_WRN("%s: llama_decode[%d] returned %d, prompt_cur.size=%zu, prompt_dft.size=%zu\n",
+                            __func__, i, ret, prompt_cur.size(), prompt_dft.size());
+                }
             }
 
             prompt_dft.push_back(id);
@@ -1161,5 +1187,19 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_gen_tokens,
                 impl->n_acc_tokens,
                 str_perf.c_str());
+
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT) {
+            auto * dft = dynamic_cast<common_speculative_state_draft *>(impl.get());
+            if (dft) {
+                LOG_INF("draft breakdown: reuse=%.1f ckpt_restore=%.1f prompt_dec=%.1f ckpt_save=%.1f idlast_dec=%.1f loop_dec=%.1f sample=%.1f ms\n",
+                        dft->t_reuse_us / 1000.0,
+                        dft->t_ckpt_restore_us / 1000.0,
+                        dft->t_prompt_dec_us / 1000.0,
+                        dft->t_ckpt_save_us / 1000.0,
+                        dft->t_idlast_dec_us / 1000.0,
+                        dft->t_loop_dec_us / 1000.0,
+                        dft->t_sample_us / 1000.0);
+            }
+        }
     }
 }
