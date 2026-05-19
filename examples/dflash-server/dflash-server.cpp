@@ -316,30 +316,43 @@ struct DFlashEngine {
         if (!no_draft)
             llama_set_hidden_capture_layers(ctx_tgt, tgt_layer_ids.data(), n_tgt_lyrs);
 
+        fprintf(stderr, "DBG: prefill n_prompt=%d n_batch=%d n_ubatch=%d\n",
+                n_prompt, (int)llama_n_batch(ctx_tgt), (int)llama_n_ubatch(ctx_tgt));
+
         {
             llama_batch batch = llama_batch_init(n_prompt, 0, 1);
             for (int32_t i = 0; i < n_prompt; i++)
                 common_batch_add(batch, prompt_tokens[i], (llama_pos)i, {0}, i == n_prompt - 1);
+            fprintf(stderr, "DBG: calling llama_decode...\n");
             if (llama_decode(ctx_tgt, batch) != 0) {
                 llama_batch_free(batch);
                 res.error = true; return res;
             }
+            fprintf(stderr, "DBG: llama_decode done\n");
             llama_batch_free(batch);
         }
 
         if (!no_draft) {
-            ctx_hidden_tmp.resize((size_t)n_prompt * n_tgt_lyrs * n_embd);
+            // Only extract + project the last max_ctx_window tokens (earlier ones
+            // get cropped immediately anyway). Falls back to n_prompt if no limit.
+            const int32_t n_proj = (max_ctx_window > 0 && n_prompt > max_ctx_window)
+                                 ? max_ctx_window : n_prompt;
+            const int32_t proj_off = n_prompt - n_proj;
+
+            fprintf(stderr, "DBG: extracting hidden states for last %d tokens (offset=%d)...\n", n_proj, proj_off);
+            ctx_hidden_tmp.resize((size_t)n_proj * n_tgt_lyrs * n_embd);
             for (int32_t li = 0; li < n_tgt_lyrs; li++) {
                 const float * h = llama_get_layer_hidden(ctx_tgt, tgt_layer_ids[li]);
-                if (!h) { res.error = true; return res; }
-                for (int32_t t = 0; t < n_prompt; t++)
+                if (!h) { fprintf(stderr, "DBG: hidden null at layer %d\n", li); res.error = true; return res; }
+                for (int32_t t = 0; t < n_proj; t++)
                     memcpy(ctx_hidden_tmp.data() + (size_t)(t * n_tgt_lyrs + li) * n_embd,
-                           h + (size_t)t * n_embd, n_embd * sizeof(float));
+                           h + (size_t)(proj_off + t) * n_embd, n_embd * sizeof(float));
             }
-            ctx_proj.resize((size_t)n_prompt * n_embd);
-            // Always use CPU for prefill projection: proj_gpu is sized for n_noise (hot-path
-            // per-iteration), not n_prompt. Using proj_gpu here would fail for long prompts.
-            bool proj_ok = llama_model_dflash_project(model_dft, ctx_hidden_tmp.data(), ctx_proj.data(), n_prompt);
+            fprintf(stderr, "DBG: hidden extraction done\n");
+            ctx_proj.resize((size_t)n_proj * n_embd);
+            fprintf(stderr, "DBG: calling dflash_project n_proj=%d...\n", n_proj);
+            bool proj_ok = llama_model_dflash_project(model_dft, ctx_hidden_tmp.data(), ctx_proj.data(), n_proj);
+            fprintf(stderr, "DBG: projection done, ok=%d\n", proj_ok);
             if (!proj_ok) { res.error = true; return res; }
             llama_set_hidden_capture_layers(ctx_tgt, nullptr, 0);
 
@@ -376,7 +389,9 @@ struct DFlashEngine {
 
         {
             int32_t n_past   = n_prompt;
-            int32_t n_ctx    = no_draft ? 0 : n_prompt;
+            int32_t n_ctx    = no_draft ? 0
+                             : (max_ctx_window > 0 && n_prompt > max_ctx_window)
+                                 ? max_ctx_window : n_prompt;
             res.n_generated  = 1;  // first token already sampled above
             int32_t & n_gen    = res.n_generated;
             int32_t & n_accept = res.n_accepted;
@@ -805,12 +820,12 @@ static int32_t       g_default_n_predict = 512;
 // ── SSE / JSON helpers ────────────────────────────────────────────────────────
 
 static std::string sse(const json & data) {
-    return "data: " + data.dump() + "\n\n";
+    return "data: " + data.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
 }
 
 static void send_json(httplib::Response & res, int status, const json & body) {
     res.status = status;
-    res.set_content(body.dump(), "application/json; charset=utf-8");
+    res.set_content(body.dump(-1, ' ', false, json::error_handler_t::replace), "application/json; charset=utf-8");
 }
 
 static void send_err(httplib::Response & res, int status, const std::string & msg) {
@@ -880,7 +895,8 @@ static void handle_completion(const httplib::Request & req, httplib::Response & 
     catch (...) { send_err(res, 400, "invalid JSON"); return; }
 
     const std::string prompt    = body.value("prompt", std::string{});
-    const int32_t     n_predict = body.value("n_predict", g_default_n_predict);
+    int32_t           n_predict = body.value("n_predict", -1);
+    if (n_predict < 0)  n_predict = body.value("max_tokens", g_default_n_predict);
     const bool        stream    = body.value("stream", false);
 
     if (prompt.empty()) { send_err(res, 400, "missing 'prompt'"); return; }
@@ -888,6 +904,13 @@ static void handle_completion(const httplib::Request & req, httplib::Response & 
     std::vector<llama_token> tokens =
         common_tokenize(g_engine.ctx_tgt, prompt, /*add_special=*/true, /*parse_special=*/true);
     if (tokens.empty()) { send_err(res, 400, "tokenization produced empty result"); return; }
+
+    const int32_t n_ctx = (int32_t)llama_n_ctx(g_engine.ctx_tgt);
+    if ((int32_t)tokens.size() >= n_ctx) {
+        send_err(res, 400, "prompt too long: " + std::to_string(tokens.size()) +
+                 " tokens >= n_ctx " + std::to_string(n_ctx));
+        return;
+    }
 
     if (!stream) {
         std::string text;
@@ -927,17 +950,21 @@ static void handle_completion(const httplib::Request & req, httplib::Response & 
         [session](size_t, httplib::DataSink & sink) -> bool {
             auto [tok_str, has_more] = session->pop();
             if (has_more) {
-                std::string chunk = sse({{"content", tok_str}, {"stop", false}});
+                std::string chunk = sse({
+                    {"choices", json::array({{
+                        {"text", tok_str},
+                        {"finish_reason", nullptr},
+                    }})},
+                });
                 sink.write(chunk.data(), chunk.size());
                 return true;
             }
             const auto & r = session->result;
             std::string last = sse({
-                {"content",          ""},
-                {"stop",             true},
-                {"tokens_predicted", r.n_generated},
-                {"draft_n_accepted", r.n_accepted},
-                {"acceptance_rate",  r.acceptance_rate()},
+                {"choices", json::array({{
+                    {"text", ""},
+                    {"finish_reason", r.n_generated >= 0 ? "stop" : "length"},
+                }})},
             });
             last += "data: [DONE]\n\n";
             sink.write(last.data(), last.size());
@@ -997,6 +1024,13 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
     std::vector<llama_token> tokens =
         common_tokenize(g_engine.ctx_tgt, prompt, /*add_special=*/true, /*parse_special=*/true);
     if (tokens.empty()) { send_err(res, 400, "tokenization produced empty result"); return; }
+
+    const int32_t n_ctx = (int32_t)llama_n_ctx(g_engine.ctx_tgt);
+    if ((int32_t)tokens.size() >= n_ctx) {
+        send_err(res, 400, "prompt too long: " + std::to_string(tokens.size()) +
+                 " tokens >= n_ctx " + std::to_string(n_ctx));
+        return;
+    }
 
     const std::string cmpl_id     = gen_completion_id();
     const int64_t     created     = now_unix();
@@ -1166,6 +1200,7 @@ int main(int argc, char ** argv) {
     srv.Post("/tokenize",            handle_tokenize);
     srv.Post("/detokenize",          handle_detokenize);
     srv.Post("/completion",          handle_completion);
+    srv.Post("/v1/completions",      handle_completion);
     srv.Post("/v1/chat/completions", handle_chat_completions);
 
     fprintf(stderr, "\nllama-dflash-server listening on http://%s:%d\n\n",
