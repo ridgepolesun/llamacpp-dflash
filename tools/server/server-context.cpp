@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <future>
 #include <memory>
 #include <filesystem>
 
@@ -88,6 +89,7 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     server_prompt_checkpoint spec_ckpt;
     common_speculative_ptr spec;
+    std::future<void> spec_prefill_future;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -2491,6 +2493,16 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // launch draft model prefill concurrently with target prompt eval
+                        if (slot.can_speculate() && n_past < slot.task->n_tokens()) {
+                            llama_tokens draft_prompt = slot.task->tokens.get_text_tokens_for_draft();
+                            auto * spec_ptr = slot.spec.get();
+                            slot.spec_prefill_future = std::async(std::launch::async,
+                                [spec_ptr, prompt = std::move(draft_prompt)]() {
+                                    common_speculative_prefill(spec_ptr, prompt);
+                                });
+                        }
+
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream && slot.task->params.return_progress) {
@@ -2878,6 +2890,9 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
+                        if (slot.spec_prefill_future.valid()) {
+                            slot.spec_prefill_future.get();
+                        }
                         common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens_for_draft());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {

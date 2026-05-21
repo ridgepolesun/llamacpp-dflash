@@ -39,6 +39,12 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
+// prefill the draft model with the given prompt tokens
+// designed to run concurrently with target model prompt eval in a separate thread
+void common_speculative_prefill(
+        common_speculative * spec,
+        const llama_tokens & prompt_tokens);
+
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
 };

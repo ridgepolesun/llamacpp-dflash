@@ -86,6 +86,7 @@ struct llama_context {
 
     // Configure which layers to capture hidden states for (call before decode).
     void set_hidden_capture_layers(const std::vector<int32_t> & layer_ids);
+    size_t get_layer_hidden_size(int32_t layer_idx) const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);

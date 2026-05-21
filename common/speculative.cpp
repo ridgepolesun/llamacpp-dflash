@@ -578,6 +578,69 @@ struct common_speculative_state_draft : public common_speculative_state {
 
         return result;
     }
+
+    void prefill(const llama_tokens & prompt_tokens) {
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        const int n_ctx = llama_n_ctx(ctx_dft);
+        const int i_start = std::max<int>(0, (int) prompt_tokens.size() - n_ctx);
+
+        // find common prefix with existing draft state
+        int n_common = 0;
+        const int n_check = std::min((int) prompt_dft.size(), (int) prompt_tokens.size() - i_start);
+        for (int i = 0; i < n_check; i++) {
+            if (prompt_dft[i] != prompt_tokens[i_start + i]) {
+                break;
+            }
+            n_common = i + 1;
+        }
+
+        // check if we can reuse via checkpoint
+        if (use_ckpt && n_common < (int) prompt_dft.size()) {
+            if (ckpt.ckpt_size > 0 && ckpt.n_tokens <= (int64_t) n_common) {
+                draft_restore_checkpoint(ckpt.ckpt_size);
+                n_common = ckpt.n_tokens;
+                prompt_dft.resize(n_common);
+            } else {
+                n_common = 0;
+                llama_memory_clear(mem_dft, false);
+                prompt_dft.clear();
+            }
+        } else if (n_common < (int) prompt_dft.size()) {
+            llama_memory_clear(mem_dft, false);
+            prompt_dft.clear();
+            n_common = 0;
+        }
+
+        // process remaining tokens in batches
+        const int n_batch = llama_n_batch(ctx_dft);
+        const int n_total = (int) prompt_tokens.size() - i_start;
+
+        for (int pos = n_common; pos < n_total; ) {
+            const int n_cur = std::min(n_batch, n_total - pos);
+
+            common_batch_clear(batch);
+            for (int i = 0; i < n_cur; i++) {
+                common_batch_add(batch, prompt_tokens[i_start + pos + i], pos + i, { 0 }, false);
+                prompt_dft.push_back(prompt_tokens[i_start + pos + i]);
+            }
+
+            int ret = llama_decode(ctx_dft, batch);
+            if (ret != 0 && ret != 1) {
+                LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
+            }
+
+            pos += n_cur;
+        }
+
+        // save checkpoint at the full prompt state
+        if (use_ckpt && prompt_dft.size() > 0) {
+            ckpt.ckpt_size = draft_create_checkpoint(prompt_dft.size(), 0);
+        }
+
+        LOG_INF("%s: prefilled %d tokens (reused %d), prompt_dft.size=%zu\n",
+                __func__, n_total - n_common, n_common, prompt_dft.size());
+    }
 };
 
 struct common_speculative_state_eagle3 : public common_speculative_state {
@@ -1199,6 +1262,23 @@ void common_speculative_print_stats(const common_speculative * spec) {
                         dft->t_idlast_dec_us / 1000.0,
                         dft->t_loop_dec_us / 1000.0,
                         dft->t_sample_us / 1000.0);
+            }
+        }
+    }
+}
+
+void common_speculative_prefill(
+        common_speculative * spec,
+        const llama_tokens & prompt_tokens) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT) {
+            auto * dft = dynamic_cast<common_speculative_state_draft *>(impl.get());
+            if (dft) {
+                dft->prefill(prompt_tokens);
             }
         }
     }

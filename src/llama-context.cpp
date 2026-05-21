@@ -866,8 +866,18 @@ float * llama_context::get_layer_hidden(int32_t layer_idx) {
     return it->second.data();
 }
 
+size_t llama_context::get_layer_hidden_size(int32_t layer_idx) const {
+    auto it = hidden_states_out.find(layer_idx);
+    if (it == hidden_states_out.end()) return 0;
+    return it->second.size();
+}
+
 void llama_context::set_hidden_capture_layers(const std::vector<int32_t> & layer_ids) {
     hidden_capture_layers = layer_ids;
+    // Clear accumulated hidden states when capture is (re)configured
+    for (auto & [il, buf] : hidden_states_out) {
+        buf.clear();
+    }
 }
 
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
@@ -1686,6 +1696,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
 
+    // NOTE: hidden_states_out is NOT cleared here — it accumulates across
+    // multiple llama_decode calls (needed for batched prefill in DFlash).
+    // The caller is responsible for clearing via set_hidden_capture_layers.
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1827,6 +1841,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // Extract per-layer hidden states for DFlash (if requested).
+        // Accumulate across ubatches so all tokens' hidden states are available.
         if (!hidden_capture_layers.empty()) {
             ggml_backend_sched_synchronize(sched.get());
             const int64_t n_embd = model.hparams.n_embd;
@@ -1835,19 +1850,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 if (t_hidden) {
                     const int64_t n_tok = t_hidden->ne[1];
                     auto & buf = hidden_states_out[il];
-                    buf.resize(n_tok * n_embd);
+                    const size_t off = buf.size();
+                    buf.resize(off + n_tok * n_embd);
                     ggml_backend_t bk = ggml_backend_sched_get_tensor_backend(sched.get(), t_hidden);
                     if (bk) {
                         if (t_hidden->type == GGML_TYPE_F32) {
-                            ggml_backend_tensor_get(t_hidden, buf.data(), 0, n_tok * n_embd * sizeof(float));
+                            ggml_backend_tensor_get(t_hidden, buf.data() + off, 0, n_tok * n_embd * sizeof(float));
                         } else {
-                            // Non-F32 hidden states (e.g. BF16): read raw bytes then convert to F32
                             const size_t raw_bytes = ggml_nbytes(t_hidden);
                             std::vector<uint8_t> raw(raw_bytes);
                             ggml_backend_tensor_get(t_hidden, raw.data(), 0, raw_bytes);
                             const auto * traits = ggml_get_type_traits(t_hidden->type);
                             GGML_ASSERT(traits && traits->to_float);
-                            traits->to_float(raw.data(), buf.data(), n_tok * n_embd);
+                            traits->to_float(raw.data(), buf.data() + off, n_tok * n_embd);
                         }
                     }
                 }
@@ -3158,6 +3173,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 void llama_set_hidden_capture_layers(llama_context * ctx, const int32_t * layer_ids, int32_t n_layers) {
     std::vector<int32_t> ids(layer_ids, layer_ids + n_layers);
     ctx->set_hidden_capture_layers(ids);
+}
+
+size_t llama_get_layer_hidden_size(llama_context * ctx, int32_t layer_idx) {
+    return ctx->get_layer_hidden_size(layer_idx);
 }
 
 float * llama_get_layer_hidden(llama_context * ctx, int32_t layer_idx) {

@@ -1145,6 +1145,9 @@ extern "C" {
     // Returns float* of shape [n_tokens * n_embd], or NULL if not available.
     LLAMA_API float * llama_get_layer_hidden(struct llama_context * ctx, int32_t layer_idx);
 
+    // DFlash: get the number of floats in the hidden state buffer for layer_idx.
+    LLAMA_API size_t llama_get_layer_hidden_size(struct llama_context * ctx, int32_t layer_idx);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

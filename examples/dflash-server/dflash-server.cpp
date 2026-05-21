@@ -176,24 +176,11 @@ struct DFlashEngine {
         if (!no_draft) {
             common_params params_dft = params;
             params_dft.model.path = params.speculative.mparams_dft.path;
-            params_dft.n_ctx      = params.n_ctx;
-            // Draft uses non-causal (bidirectional) attention with full KV recompute
-            // each iteration. n_ctx and n_ubatch must both equal the max draft batch
-            // size (ctx_window + n_noise). If sliding window is set, bound tightly;
-            // otherwise match target n_ctx (user must pass -c to bound it).
-            if (arg_draft_ctx_max > 0) {
-                // +64: headroom for n_noise (determined after model load, max ~32)
-                const int32_t draft_ctx = arg_draft_ctx_max + 64;
-                params_dft.n_ctx    = draft_ctx;
-                params_dft.n_ubatch = draft_ctx;
-            } else {
-                // Without sliding window the draft batch grows unboundedly.
-                // At minimum ensure n_ubatch == n_ctx (required by non-causal attn).
-                params_dft.n_ubatch = params_dft.n_ctx;
-                fprintf(stderr, "WARNING: --draft-ctx-max not set; draft model will "
-                        "use n_ctx=%d which causes O(n²) cost. "
-                        "Recommend: --draft-ctx-max 256\n", params_dft.n_ctx);
-            }
+            // Draft uses incremental KV cache: Q from noise (small) attends to
+            // full KV cache history. n_ctx matches target for capacity.
+            // n_ubatch kept small — initial prefill is split into chunks.
+            params_dft.n_ctx    = params.n_ctx;
+            params_dft.n_ubatch = 128;
             dft_init  = common_init_from_params(params_dft);
             model_dft = dft_init->model();
             ctx_dft   = dft_init->context();
@@ -316,44 +303,50 @@ struct DFlashEngine {
         if (!no_draft)
             llama_set_hidden_capture_layers(ctx_tgt, tgt_layer_ids.data(), n_tgt_lyrs);
 
-        fprintf(stderr, "DBG: prefill n_prompt=%d n_batch=%d n_ubatch=%d\n",
-                n_prompt, (int)llama_n_batch(ctx_tgt), (int)llama_n_ubatch(ctx_tgt));
-
         {
-            llama_batch batch = llama_batch_init(n_prompt, 0, 1);
-            for (int32_t i = 0; i < n_prompt; i++)
-                common_batch_add(batch, prompt_tokens[i], (llama_pos)i, {0}, i == n_prompt - 1);
-            fprintf(stderr, "DBG: calling llama_decode...\n");
-            if (llama_decode(ctx_tgt, batch) != 0) {
+            const int32_t tgt_batch = (int32_t)llama_n_batch(ctx_tgt);
+            for (int32_t i_start = 0; i_start < n_prompt; i_start += tgt_batch) {
+                const int32_t i_end = std::min(i_start + tgt_batch, n_prompt);
+                const int32_t n_cur = i_end - i_start;
+                llama_batch batch = llama_batch_init(n_cur, 0, 1);
+                for (int32_t i = i_start; i < i_end; i++)
+                    common_batch_add(batch, prompt_tokens[i], (llama_pos)i, {0}, i == n_prompt - 1);
+                if (llama_decode(ctx_tgt, batch) != 0) {
+                    llama_batch_free(batch);
+                    res.error = true; return res;
+                }
                 llama_batch_free(batch);
-                res.error = true; return res;
             }
-            fprintf(stderr, "DBG: llama_decode done\n");
-            llama_batch_free(batch);
         }
 
         if (!no_draft) {
-            // Only extract + project the last max_ctx_window tokens (earlier ones
-            // get cropped immediately anyway). Falls back to n_prompt if no limit.
-            const int32_t n_proj = (max_ctx_window > 0 && n_prompt > max_ctx_window)
-                                 ? max_ctx_window : n_prompt;
-            const int32_t proj_off = n_prompt - n_proj;
-
-            fprintf(stderr, "DBG: extracting hidden states for last %d tokens (offset=%d)...\n", n_proj, proj_off);
-            ctx_hidden_tmp.resize((size_t)n_proj * n_tgt_lyrs * n_embd);
+            // Hidden states are accumulated across ubatches in llama-context,
+            // so we get all n_prompt tokens' hidden states even with batched prefill.
+            ctx_hidden_tmp.resize((size_t)n_prompt * n_tgt_lyrs * n_embd);
             for (int32_t li = 0; li < n_tgt_lyrs; li++) {
                 const float * h = llama_get_layer_hidden(ctx_tgt, tgt_layer_ids[li]);
-                if (!h) { fprintf(stderr, "DBG: hidden null at layer %d\n", li); res.error = true; return res; }
-                for (int32_t t = 0; t < n_proj; t++)
+                if (!h) { res.error = true; return res; }
+                for (int32_t t = 0; t < n_prompt; t++)
                     memcpy(ctx_hidden_tmp.data() + (size_t)(t * n_tgt_lyrs + li) * n_embd,
-                           h + (size_t)(proj_off + t) * n_embd, n_embd * sizeof(float));
+                           h + (size_t)t * n_embd, n_embd * sizeof(float));
             }
-            fprintf(stderr, "DBG: hidden extraction done\n");
-            ctx_proj.resize((size_t)n_proj * n_embd);
-            fprintf(stderr, "DBG: calling dflash_project n_proj=%d...\n", n_proj);
-            bool proj_ok = llama_model_dflash_project(model_dft, ctx_hidden_tmp.data(), ctx_proj.data(), n_proj);
-            fprintf(stderr, "DBG: projection done, ok=%d\n", proj_ok);
-            if (!proj_ok) { res.error = true; return res; }
+            // Project in batches using GPU (proj_gpu is sized for n_noise)
+            ctx_proj.resize((size_t)n_prompt * n_embd);
+            {
+                const int32_t proj_batch = n_noise;
+                bool proj_ok = true;
+                for (int32_t t = 0; t < n_prompt && proj_ok; t += proj_batch) {
+                    const int32_t n_cur = std::min(proj_batch, n_prompt - t);
+                    proj_ok = proj_gpu
+                        ? llama_dflash_proj_gpu_apply(proj_gpu,
+                              ctx_hidden_tmp.data() + (size_t)t * n_tgt_lyrs * n_embd,
+                              ctx_proj.data() + (size_t)t * n_embd, n_cur)
+                        : llama_model_dflash_project(model_dft,
+                              ctx_hidden_tmp.data() + (size_t)t * n_tgt_lyrs * n_embd,
+                              ctx_proj.data() + (size_t)t * n_embd, n_cur);
+                }
+                if (!proj_ok) { res.error = true; return res; }
+            }
             llama_set_hidden_capture_layers(ctx_tgt, nullptr, 0);
 
             // Detect hybrid model on first call
@@ -389,9 +382,11 @@ struct DFlashEngine {
 
         {
             int32_t n_past   = n_prompt;
-            int32_t n_ctx    = no_draft ? 0
-                             : (max_ctx_window > 0 && n_prompt > max_ctx_window)
-                                 ? max_ctx_window : n_prompt;
+            // draft KV cache position tracking:
+            // ctx_proj holds the PENDING projections to send in the next draft decode.
+            // After the first draft decode, ctx_proj is replaced by just the new projections.
+            int32_t draft_kv_pos = 0;
+            int32_t n_pending    = no_draft ? 0 : (int32_t)(ctx_proj.size() / n_embd);
             res.n_generated  = 1;  // first token already sampled above
             int32_t & n_gen    = res.n_generated;
             int32_t & n_accept = res.n_accepted;
@@ -438,6 +433,7 @@ struct DFlashEngine {
             t_decode_start = ggml_time_us();
             llama_token tok_vb = LLAMA_TOKEN_NULL;
             size_t recr_snap_written = 0;
+            bool draft_prefill_done = false;
 
             while (n_gen < max_tokens) {
                 bool ok = true;
@@ -453,20 +449,49 @@ struct DFlashEngine {
                     t_noise_build_us += ggml_time_us() - t0_nb;
                 }
 
-                // Draft decode: full [ctx | noise] batch
-                const int32_t n_dft = n_ctx + n_noise;
+                // Draft decode: [pending_proj | noise] — incremental KV cache
+                // If n_pending + n_noise > n_ubatch, split: fill KV cache with
+                // projection chunks first, then decode the final chunk with noise.
                 {
                     int64_t t0_bb = ggml_time_us();
+                    llama_set_embeddings(ctx_dft, true);
+                    const int32_t dft_ubatch = (int32_t)llama_n_ubatch(ctx_dft);
+                    const int32_t max_proj_per_chunk = dft_ubatch - n_noise;
+                    int32_t proj_sent = 0;
+
+                    // Phase 1: fill KV cache with projection-only chunks (output discarded)
+                    while (n_pending - proj_sent > max_proj_per_chunk) {
+                        const int32_t n_chunk = max_proj_per_chunk;
+                        llama_batch dft_b = llama_batch_init(n_chunk + n_noise, n_embd, 1);
+                        dft_b.n_tokens = 0;
+                        for (int32_t t = 0; t < n_chunk; t++)
+                            batch_embd_add(dft_b, ctx_proj.data() + (size_t)(proj_sent + t) * n_embd, n_embd,
+                                           (llama_pos)(draft_kv_pos + proj_sent + t), 0, true);
+                        for (int32_t ni = 0; ni < n_noise; ni++)
+                            batch_embd_add(dft_b, noise_embd.data() + (size_t)ni * n_embd, n_embd,
+                                           (llama_pos)(draft_kv_pos + proj_sent + n_chunk + ni), 0, true);
+                        int64_t t0 = ggml_time_us();
+                        bool dft_ok = llama_decode(ctx_dft, dft_b) == 0;
+                        t_draft_us += ggml_time_us() - t0;
+                        llama_batch_free(dft_b);
+                        if (!dft_ok) { ok = false; break; }
+                        // Remove noise KV, keep projection KV
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, draft_kv_pos + proj_sent + n_chunk, -1);
+                        proj_sent += n_chunk;
+                    }
+                    if (!ok) break;
+
+                    // Phase 2: final chunk with real noise (collect embeddings from this)
+                    const int32_t n_remaining = n_pending - proj_sent;
+                    const int32_t n_dft = n_remaining + n_noise;
                     llama_batch dft_b = llama_batch_init(n_dft, n_embd, 1);
                     dft_b.n_tokens = 0;
-                    for (int32_t t = 0; t < n_ctx; t++)
-                        batch_embd_add(dft_b, ctx_proj.data() + (size_t)t * n_embd, n_embd,
-                                       (llama_pos)t, 0, true);
+                    for (int32_t t = 0; t < n_remaining; t++)
+                        batch_embd_add(dft_b, ctx_proj.data() + (size_t)(proj_sent + t) * n_embd, n_embd,
+                                       (llama_pos)(draft_kv_pos + proj_sent + t), 0, true);
                     for (int32_t ni = 0; ni < n_noise; ni++)
                         batch_embd_add(dft_b, noise_embd.data() + (size_t)ni * n_embd, n_embd,
-                                       (llama_pos)(n_ctx + ni), 0, true);
-                    llama_set_embeddings(ctx_dft, true);
-                    llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+                                       (llama_pos)(draft_kv_pos + proj_sent + n_remaining + ni), 0, true);
                     t_batch_build_us += ggml_time_us() - t0_bb;
                     int64_t t0 = ggml_time_us();
                     bool dft_ok = llama_decode(ctx_dft, dft_b) == 0;
@@ -478,11 +503,35 @@ struct DFlashEngine {
                 }
                 if (!ok) break;
 
+                // Remove noise K/V from draft cache (keep context projections)
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, draft_kv_pos + n_pending, -1);
+
+                // First draft decode fills the entire KV cache (expensive).
+                // Reset timing so this cost is counted as prefill, not decode.
+                if (!draft_prefill_done) {
+                    draft_prefill_done = true;
+                    t_prefill_us += ggml_time_us() - t_decode_start;
+                    t_decode_start = ggml_time_us();
+                    t_draft_us = 0; t_batch_build_us = 0;
+                    n_iters = 0;
+                }
+
                 // Collect draft embeddings (last n_cands noise outputs)
+                // In the final chunk, noise starts at index (n_pending - proj_sent_final)
+                // where proj_sent_final = how many proj tokens were in the last batch.
                 {
+                    const int32_t dft_ubatch = (int32_t)llama_n_ubatch(ctx_dft);
+                    const int32_t max_proj = dft_ubatch - n_noise;
+                    const int32_t n_last_proj = (n_pending <= max_proj) ? n_pending
+                                              : n_pending - (n_pending - max_proj + max_proj - 1) / max_proj * max_proj;
+                    // Simpler: just compute directly
+                    int32_t proj_already_sent = 0;
+                    while (n_pending - proj_already_sent > max_proj) proj_already_sent += max_proj;
+                    const int32_t n_final_proj = n_pending - proj_already_sent;
+
                     int64_t t0_ec = ggml_time_us();
                     for (int32_t ni = 0; ni < n_cands && ok; ni++) {
-                        const float * e = llama_get_embeddings_ith(ctx_dft, n_ctx + 1 + ni);
+                        const float * e = llama_get_embeddings_ith(ctx_dft, n_final_proj + 1 + ni);
                         if (!e) { ok = false; break; }
                         memcpy(draft_embd.data() + (size_t)ni * n_embd, e, n_embd * sizeof(float));
                     }
@@ -596,17 +645,11 @@ struct DFlashEngine {
                             t_project_us += ggml_time_us() - t0;
                             if (proj_ok2) {
                                 int64_t t0_cp = ggml_time_us();
-                                ctx_proj.resize((size_t)(n_ctx + n_ctx_new) * n_embd);
-                                memcpy(ctx_proj.data() + (size_t)n_ctx * n_embd,
-                                       proj_scratch.data(), (size_t)n_ctx_new * n_embd * sizeof(float));
-                                n_ctx += n_ctx_new;
-                                if (max_ctx_window > 0 && n_ctx > max_ctx_window) {
-                                    const int32_t drop = n_ctx - max_ctx_window;
-                                    memmove(ctx_proj.data(), ctx_proj.data() + (size_t)drop * n_embd,
-                                            (size_t)max_ctx_window * n_embd * sizeof(float));
-                                    ctx_proj.resize((size_t)max_ctx_window * n_embd);
-                                    n_ctx = max_ctx_window;
-                                }
+                                // Replace ctx_proj with new projections (for next draft decode)
+                                ctx_proj.resize((size_t)n_ctx_new * n_embd);
+                                memcpy(ctx_proj.data(), proj_scratch.data(), (size_t)n_ctx_new * n_embd * sizeof(float));
+                                draft_kv_pos += n_pending;  // advance past context we just cached
+                                n_pending = n_ctx_new;
                                 t_ctxproj_us += ggml_time_us() - t0_cp;
                             }
                         }
@@ -681,17 +724,11 @@ struct DFlashEngine {
                         t_project_us += ggml_time_us() - t0;
                         if (proj_ok3) {
                             int64_t t0_cp2 = ggml_time_us();
-                            ctx_proj.resize((size_t)(n_ctx + n_ctx_new) * n_embd);
-                            memcpy(ctx_proj.data() + (size_t)n_ctx * n_embd,
-                                   proj_scratch.data(), (size_t)n_ctx_new * n_embd * sizeof(float));
-                            n_ctx += n_ctx_new;
-                            if (max_ctx_window > 0 && n_ctx > max_ctx_window) {
-                                const int32_t drop = n_ctx - max_ctx_window;
-                                memmove(ctx_proj.data(), ctx_proj.data() + (size_t)drop * n_embd,
-                                        (size_t)max_ctx_window * n_embd * sizeof(float));
-                                ctx_proj.resize((size_t)max_ctx_window * n_embd);
-                                n_ctx = max_ctx_window;
-                            }
+                            // Replace ctx_proj with new projections (for next draft decode)
+                            ctx_proj.resize((size_t)n_ctx_new * n_embd);
+                            memcpy(ctx_proj.data(), proj_scratch.data(), (size_t)n_ctx_new * n_embd * sizeof(float));
+                            draft_kv_pos += n_pending;
+                            n_pending = n_ctx_new;
                             t_ctxproj_us += ggml_time_us() - t0_cp2;
                         }
                     }
