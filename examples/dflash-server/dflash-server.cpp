@@ -69,6 +69,9 @@ struct GenerateResult {
     int32_t n_generated  = 0;
     int32_t n_accepted   = 0;   // draft tokens accepted
     bool    error        = false;
+    bool    stopped_word = false; // stopped by a stop sequence (vs EOS/max_tokens)
+    bool    stopped_eos  = false; // stopped by EOS/EOG token
+    bool    stopped_limit = false; // stopped by max_tokens
 
     float acceptance_rate() const {
         return n_generated > 1 ? (float)n_accepted / (float)(n_generated - 1) : 0.0f;
@@ -80,30 +83,38 @@ struct GenerateResult {
 struct TokenStream {
     std::mutex              mtx;
     std::condition_variable cv;
-    std::deque<std::string> buf;
+
+    struct StreamChunk {
+        std::string text;
+        std::string type; // "content", "reasoning_content", or "tool_calls"
+    };
+
+    std::deque<StreamChunk> buf;
     bool                    done = false;
     GenerateResult          result;
+    std::string             full_text;
+    bool                    stopped_by_word = false;
 
-    void push(const std::string & s) {
-        { std::lock_guard<std::mutex> lock(mtx); buf.push_back(s); }
+    void push(const std::string & text, const std::string & type = "content") {
+        if (text.empty()) return;
+        { std::lock_guard<std::mutex> lock(mtx); buf.push_back({text, type}); }
         cv.notify_one();
     }
 
-    void finish(const GenerateResult & r) {
-        { std::lock_guard<std::mutex> lock(mtx); result = r; done = true; }
+    void finish(const GenerateResult & r, const std::string & text = "", bool stopped_word = false) {
+        { std::lock_guard<std::mutex> lock(mtx); result = r; full_text = text; stopped_by_word = stopped_word; done = true; }
         cv.notify_all();
     }
 
-    // Returns (token_string, true) or ("", false) when done.
-    std::pair<std::string, bool> pop() {
+    std::pair<StreamChunk, bool> pop() {
         std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [this] { return !buf.empty() || done; });
+        cv.wait(lock, [&] { return !buf.empty() || done; });
         if (!buf.empty()) {
-            std::string s = buf.front();
+            auto chunk = std::move(buf.front());
             buf.pop_front();
-            return {s, true};
+            return {chunk, true};
         }
-        return {"", false};
+        return {{}, false};
     }
 };
 
@@ -136,6 +147,7 @@ struct DFlashEngine {
 
     // ── Sampler ────────────────────────────────────────────────────────────
     common_sampler * smpl_tgt = nullptr;
+    common_params_sampling default_sparams; // saved for restoring after per-request grammar
 
     // ── RNG for probabilistic acceptance ────────────────────────────────────
     std::mt19937 rng{std::random_device{}()};
@@ -159,6 +171,13 @@ struct DFlashEngine {
     // CPU fallback (used if GPU snapshot unavailable)
     size_t recr_snap_size      = 0;
     std::vector<uint8_t> recr_snap;
+
+    // ── Prefix cache support ───────────────────────────────────────────────
+    std::vector<llama_token> cached_prompt;
+    std::vector<uint8_t>     cached_recr_snap;   // SSM state at end of cached prompt
+    size_t                   cached_recr_snap_written = 0;
+    llama_gpu_snapshot *     cached_gpu_snap = nullptr;
+    bool                     cached_snap_valid = false;
 
     // ── Initialise engine (load models, allocate buffers) ──────────────────
     bool init(common_params & params, int32_t arg_draft_ctx_max) {
@@ -252,6 +271,7 @@ struct DFlashEngine {
         }
 
         smpl_tgt = common_sampler_init(model_tgt, params.sampling);
+        default_sparams = params.sampling;
         if (!smpl_tgt) {
             fprintf(stderr, "%s: failed to init sampler\n", __func__);
             return false;
@@ -262,11 +282,9 @@ struct DFlashEngine {
         return true;
     }
 
-    // ── Reset state between requests ────────────────────────────────────────
+    // ── Reset state between requests (preserves KV cache for prefix cache) ──
     void reset() {
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, -1, -1);
-        if (ctx_dft)
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+        // Don't clear KV cache here — generate() handles prefix cache
         common_sampler_reset(smpl_tgt);
         ctx_proj.clear();
         ctx_hidden_tmp.clear();
@@ -298,14 +316,64 @@ struct DFlashEngine {
         int64_t t_kv_crop_us = 0;
         int64_t t_sampler_us = 0;
 
-        // ── Prefill ──────────────────────────────────────────────────────
+        // ── Prefill with prefix cache ─────────────────────────────────────
         const int64_t t_prefill_start = ggml_time_us();
         if (!no_draft)
             llama_set_hidden_capture_layers(ctx_tgt, tgt_layer_ids.data(), n_tgt_lyrs);
 
+        // Find common prefix with cached prompt
+        int32_t n_past_cached = 0;
+        {
+            const int32_t n_check = std::min((int32_t)cached_prompt.size(), n_prompt);
+            for (int32_t i = 0; i < n_check; i++) {
+                if (cached_prompt[i] != prompt_tokens[i]) break;
+                n_past_cached = i + 1;
+            }
+        }
+
+        // If prompt diverges from cache, we need to handle KV/SSM rollback
+        if (n_past_cached < (int32_t)cached_prompt.size()) {
+            // Try to remove tokens beyond the common prefix
+            if (n_past_cached == 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, -1, -1);
+                if (ctx_dft)
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+                cached_snap_valid = false;
+            } else {
+                bool rm_ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_cached, -1);
+                if (!rm_ok) {
+                    // SSM model can't do partial removal — restore snapshot if available
+                    if (cached_snap_valid) {
+                        if (cached_gpu_snap) {
+                            llama_gpu_snapshot_restore(ctx_tgt, cached_gpu_snap, 0,
+                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        } else if (cached_recr_snap_written > 0) {
+                            llama_state_seq_set_data_ext(ctx_tgt, cached_recr_snap.data(),
+                                    cached_recr_snap_written, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        }
+                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_cached, -1);
+                    } else {
+                        // No valid snapshot — full reset
+                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, -1, -1);
+                        if (ctx_dft)
+                            llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+                        n_past_cached = 0;
+                    }
+                }
+                if (ctx_dft)
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_past_cached, -1);
+            }
+        }
+
+        if (n_past_cached > 0) {
+            fprintf(stderr, "%s: prefix cache hit: %d / %d tokens reused\n",
+                    __func__, n_past_cached, n_prompt);
+        }
+
+        // Process only the new tokens
         {
             const int32_t tgt_batch = (int32_t)llama_n_batch(ctx_tgt);
-            for (int32_t i_start = 0; i_start < n_prompt; i_start += tgt_batch) {
+            for (int32_t i_start = n_past_cached; i_start < n_prompt; i_start += tgt_batch) {
                 const int32_t i_end = std::min(i_start + tgt_batch, n_prompt);
                 const int32_t n_cur = i_end - i_start;
                 llama_batch batch = llama_batch_init(n_cur, 0, 1);
@@ -319,34 +387,58 @@ struct DFlashEngine {
             }
         }
 
+        // Save prompt for next request's prefix cache
+        cached_prompt.assign(prompt_tokens.begin(), prompt_tokens.end());
+
         if (!no_draft) {
-            // Hidden states are accumulated across ubatches in llama-context,
-            // so we get all n_prompt tokens' hidden states even with batched prefill.
-            ctx_hidden_tmp.resize((size_t)n_prompt * n_tgt_lyrs * n_embd);
-            for (int32_t li = 0; li < n_tgt_lyrs; li++) {
-                const float * h = llama_get_layer_hidden(ctx_tgt, tgt_layer_ids[li]);
-                if (!h) { res.error = true; return res; }
-                for (int32_t t = 0; t < n_prompt; t++)
-                    memcpy(ctx_hidden_tmp.data() + (size_t)(t * n_tgt_lyrs + li) * n_embd,
-                           h + (size_t)t * n_embd, n_embd * sizeof(float));
-            }
-            // Project in batches using GPU (proj_gpu is sized for n_noise)
-            ctx_proj.resize((size_t)n_prompt * n_embd);
-            {
-                const int32_t proj_batch = n_noise;
-                bool proj_ok = true;
-                for (int32_t t = 0; t < n_prompt && proj_ok; t += proj_batch) {
-                    const int32_t n_cur = std::min(proj_batch, n_prompt - t);
-                    proj_ok = proj_gpu
-                        ? llama_dflash_proj_gpu_apply(proj_gpu,
-                              ctx_hidden_tmp.data() + (size_t)t * n_tgt_lyrs * n_embd,
-                              ctx_proj.data() + (size_t)t * n_embd, n_cur)
-                        : llama_model_dflash_project(model_dft,
-                              ctx_hidden_tmp.data() + (size_t)t * n_tgt_lyrs * n_embd,
-                              ctx_proj.data() + (size_t)t * n_embd, n_cur);
+            const int32_t n_new = n_prompt - n_past_cached;
+
+            if (n_new > 0) {
+                // Extract hidden states only for NEW tokens
+                ctx_hidden_tmp.resize((size_t)n_new * n_tgt_lyrs * n_embd);
+                for (int32_t li = 0; li < n_tgt_lyrs; li++) {
+                    const float * h = llama_get_layer_hidden(ctx_tgt, tgt_layer_ids[li]);
+                    if (!h) { res.error = true; return res; }
+                    for (int32_t t = 0; t < n_new; t++)
+                        memcpy(ctx_hidden_tmp.data() + (size_t)(t * n_tgt_lyrs + li) * n_embd,
+                               h + (size_t)t * n_embd, n_embd * sizeof(float));
                 }
-                if (!proj_ok) { res.error = true; return res; }
+
+                // Preserve cached projections, compute new ones
+                std::vector<float> old_proj;
+                if (n_past_cached > 0 && ctx_proj.size() >= (size_t)n_past_cached * n_embd) {
+                    old_proj.assign(ctx_proj.begin(), ctx_proj.begin() + (size_t)n_past_cached * n_embd);
+                }
+
+                ctx_proj.resize((size_t)n_prompt * n_embd);
+
+                // Copy cached projections
+                if (!old_proj.empty()) {
+                    memcpy(ctx_proj.data(), old_proj.data(), old_proj.size() * sizeof(float));
+                }
+
+                // Project only new tokens
+                {
+                    const int32_t proj_batch = n_noise;
+                    bool proj_ok = true;
+                    for (int32_t t = 0; t < n_new && proj_ok; t += proj_batch) {
+                        const int32_t n_cur = std::min(proj_batch, n_new - t);
+                        float * dst = ctx_proj.data() + (size_t)(n_past_cached + t) * n_embd;
+                        proj_ok = proj_gpu
+                            ? llama_dflash_proj_gpu_apply(proj_gpu,
+                                  ctx_hidden_tmp.data() + (size_t)t * n_tgt_lyrs * n_embd,
+                                  dst, n_cur)
+                            : llama_model_dflash_project(model_dft,
+                                  ctx_hidden_tmp.data() + (size_t)t * n_tgt_lyrs * n_embd,
+                                  dst, n_cur);
+                    }
+                    if (!proj_ok) { res.error = true; return res; }
+                }
+            } else {
+                // Full cache hit — reuse all projections, just resize
+                ctx_proj.resize((size_t)n_prompt * n_embd);
             }
+
             llama_set_hidden_capture_layers(ctx_tgt, nullptr, 0);
 
             // Detect hybrid model on first call
@@ -367,6 +459,28 @@ struct DFlashEngine {
                 }
                 recr_snap_init_done = true;
             }
+
+            // Save SSM snapshot for prefix cache (for next request)
+            if (use_recr_snap) {
+                cached_snap_valid = false;
+                if (gpu_snap) {
+                    if (!cached_gpu_snap) {
+                        cached_gpu_snap = llama_gpu_snapshot_create(ctx_tgt);
+                    }
+                    if (cached_gpu_snap) {
+                        llama_gpu_snapshot_save(ctx_tgt, cached_gpu_snap, 0,
+                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        cached_snap_valid = true;
+                    }
+                } else {
+                    const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, 0,
+                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    cached_recr_snap.resize(sz);
+                    cached_recr_snap_written = llama_state_seq_get_data_ext(ctx_tgt,
+                            cached_recr_snap.data(), sz, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    cached_snap_valid = (cached_recr_snap_written == sz);
+                }
+            }
         }
 
         t_prefill_us = ggml_time_us() - t_prefill_start;
@@ -375,7 +489,7 @@ struct DFlashEngine {
         llama_token tok = common_sampler_sample(smpl_tgt, ctx_tgt, -1);
         common_sampler_accept(smpl_tgt, tok, true);
         if (!llama_vocab_is_eog(vocab_tgt, tok)) {
-            if (!on_token(common_token_to_piece(ctx_tgt, tok))) goto done;
+            if (!on_token(common_token_to_piece(ctx_tgt, tok, false))) goto done;
         } else {
             goto done;
         }
@@ -405,7 +519,7 @@ struct DFlashEngine {
                     common_sampler_accept(smpl_tgt, tok, true);
                     n_gen++;
                     if (llama_vocab_is_eog(vocab_tgt, tok)) break;
-                    if (!on_token(common_token_to_piece(ctx_tgt, tok))) break;
+                    if (!on_token(common_token_to_piece(ctx_tgt, tok, false))) break;
                 }
                 res.n_generated = n_gen;
                 t_decode_us = ggml_time_us() - t_decode_start;
@@ -617,7 +731,7 @@ struct DFlashEngine {
                         n_accepted++;
                         n_gen++;
                         if (llama_vocab_is_eog(vocab_tgt, tok)) goto done;
-                        if (!on_token(common_token_to_piece(ctx_tgt, tok))) goto done;
+                        if (!on_token(common_token_to_piece(ctx_tgt, tok, false))) goto done;
                     } else {
                         // Rejected: use target argmax as corrected token
                         tok = tgt_tok;
@@ -656,7 +770,7 @@ struct DFlashEngine {
 
                         n_gen++;
                         if (llama_vocab_is_eog(vocab_tgt, tok)) goto done;
-                        if (!on_token(common_token_to_piece(ctx_tgt, tok))) goto done;
+                        if (!on_token(common_token_to_piece(ctx_tgt, tok, false))) goto done;
 
                         // Crop KV cache
                         {
@@ -742,7 +856,7 @@ struct DFlashEngine {
                         n_gen++;
                         n_past = n_past_before_vb + 1 + n_cands;
                         if (llama_vocab_is_eog(vocab_tgt, tok)) goto done;
-                        if (!on_token(common_token_to_piece(ctx_tgt, tok))) goto done;
+                        if (!on_token(common_token_to_piece(ctx_tgt, tok, false))) goto done;
                     }
                 }
                 if (!ok) break;
@@ -837,6 +951,25 @@ done:
             fprintf(stderr, "  total time     = %10.2f ms / %5d tokens\n",
                     t_total_s * 1e3, n_prompt + res.n_generated);
         }
+
+        // ── Rollback KV cache to prompt-only state for prefix cache ──
+        // After generation, KV has prompt + generated tokens. Remove generated
+        // tokens so next request can reuse the prompt prefix.
+        {
+            bool rm_ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_prompt, -1);
+            if (!rm_ok && use_recr_snap && cached_snap_valid) {
+                // Hybrid model: restore SSM to prompt-end state, then clear beyond prompt
+                if (cached_gpu_snap) {
+                    llama_gpu_snapshot_restore(ctx_tgt, cached_gpu_snap, 0,
+                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                } else if (cached_recr_snap_written > 0) {
+                    llama_state_seq_set_data_ext(ctx_tgt, cached_recr_snap.data(),
+                            cached_recr_snap_written, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_prompt, -1);
+            }
+        }
+
         return res;
     }
 
@@ -985,11 +1118,11 @@ static void handle_completion(const httplib::Request & req, httplib::Response & 
 
     res.set_chunked_content_provider("text/event-stream",
         [session](size_t, httplib::DataSink & sink) -> bool {
-            auto [tok_str, has_more] = session->pop();
+            auto [chunk_data, has_more] = session->pop();
             if (has_more) {
                 std::string chunk = sse({
                     {"choices", json::array({{
-                        {"text", tok_str},
+                        {"text", chunk_data.text},
                         {"finish_reason", nullptr},
                     }})},
                 });
@@ -1013,6 +1146,89 @@ static void handle_completion(const httplib::Request & req, httplib::Response & 
 
 // ── /v1/chat/completions ──────────────────────────────────────────────────────
 
+// Fallback parser for Qwen-style XML tool calls:
+//   <tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n...</function>\n</tool_call>
+// Separates thinking (<think>...</think>) from content and extracts tool calls.
+static common_chat_msg parse_qwen_xml_tool_calls(const std::string & text) {
+    common_chat_msg msg;
+    msg.role = "assistant";
+
+    // Extract thinking
+    std::string remaining = text;
+    {
+        auto think_start = remaining.find("<think>");
+        auto think_end   = remaining.find("</think>");
+        if (think_start != std::string::npos && think_end != std::string::npos) {
+            size_t content_start = think_start + 7; // strlen("<think>")
+            msg.reasoning_content = remaining.substr(content_start, think_end - content_start);
+            // Remove think block from remaining
+            remaining = remaining.substr(0, think_start) + remaining.substr(think_end + 8); // strlen("</think>")
+        }
+    }
+
+    // Extract tool calls
+    size_t search_pos = 0;
+    while (true) {
+        auto tc_start = remaining.find("<tool_call>", search_pos);
+        if (tc_start == std::string::npos) break;
+        auto tc_end = remaining.find("</tool_call>", tc_start);
+        if (tc_end == std::string::npos) break;
+
+        std::string tc_body = remaining.substr(tc_start + 11, tc_end - tc_start - 11); // strlen("<tool_call>")
+
+        // Extract function name: <function=NAME>
+        common_chat_tool_call tool_call;
+        auto fn_start = tc_body.find("<function=");
+        if (fn_start != std::string::npos) {
+            auto fn_name_start = fn_start + 10; // strlen("<function=")
+            auto fn_name_end = tc_body.find(">", fn_name_start);
+            if (fn_name_end != std::string::npos) {
+                tool_call.name = tc_body.substr(fn_name_start, fn_name_end - fn_name_start);
+            }
+
+            // Extract parameters: <parameter=KEY>\nVALUE\n</parameter>
+            json args = json::object();
+            size_t param_pos = fn_name_end + 1;
+            while (true) {
+                auto p_start = tc_body.find("<parameter=", param_pos);
+                if (p_start == std::string::npos) break;
+                auto key_start = p_start + 11; // strlen("<parameter=")
+                auto key_end = tc_body.find(">", key_start);
+                if (key_end == std::string::npos) break;
+                std::string key = tc_body.substr(key_start, key_end - key_start);
+
+                auto val_start = key_end + 1;
+                auto p_end = tc_body.find("</parameter>", val_start);
+                if (p_end == std::string::npos) break;
+                std::string val = tc_body.substr(val_start, p_end - val_start);
+
+                // Trim whitespace
+                while (!val.empty() && (val.front() == '\n' || val.front() == ' ')) val.erase(val.begin());
+                while (!val.empty() && (val.back() == '\n' || val.back() == ' '))  val.pop_back();
+
+                args[key] = val;
+                param_pos = p_end + 12; // strlen("</parameter>")
+            }
+            tool_call.arguments = args.dump();
+        }
+
+        if (!tool_call.name.empty()) {
+            msg.tool_calls.push_back(std::move(tool_call));
+        }
+
+        // Remove tool_call block from remaining content
+        remaining = remaining.substr(0, tc_start) + remaining.substr(tc_end + 12); // strlen("</tool_call>")
+        search_pos = tc_start;
+    }
+
+    // Remaining text is content (trim whitespace)
+    while (!remaining.empty() && (remaining.front() == '\n' || remaining.front() == ' ')) remaining.erase(remaining.begin());
+    while (!remaining.empty() && (remaining.back() == '\n' || remaining.back() == ' '))  remaining.pop_back();
+    msg.content = remaining;
+
+    return msg;
+}
+
 static void handle_chat_completions(const httplib::Request & req, httplib::Response & res) {
     json body;
     try { body = json::parse(req.body); }
@@ -1027,7 +1243,25 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
     const bool        stream      = body.value("stream", false);
     const std::string model_name  = body.value("model", "dflash");
 
-    // JSON messages → common_chat_msg (handles string/array content, same as llama-server)
+    // Parse tools
+    auto tools_j     = body.value("tools", json());
+    auto has_tools   = tools_j.is_array() && !tools_j.empty();
+    auto tool_choice = body.value("tool_choice", std::string("auto"));
+
+    // Parse stop sequences
+    std::vector<std::string> stop_words;
+    if (body.contains("stop")) {
+        const auto & stop_j = body["stop"];
+        if (stop_j.is_string()) {
+            stop_words.push_back(stop_j.get<std::string>());
+        } else if (stop_j.is_array()) {
+            for (const auto & s : stop_j) {
+                if (s.is_string()) stop_words.push_back(s.get<std::string>());
+            }
+        }
+    }
+
+    // JSON messages → common_chat_msg
     std::vector<common_chat_msg> msgs;
     try {
         msgs = common_chat_msgs_parse_oaicompat(*messages_j);
@@ -1035,27 +1269,63 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
         send_err(res, 400, e.what()); return;
     }
 
-    // Apply chat template
+    // Apply chat template with tools + thinking support
     std::string prompt;
+    common_chat_parser_params parser_params;
+    std::string grammar_str;
+    bool grammar_lazy = false;
+    std::vector<common_grammar_trigger> grammar_triggers;
+    std::vector<std::string> preserved_tokens_str;
+    std::string generation_prompt_str;
     {
         auto tmpls = common_chat_templates_init(g_engine.model_tgt, "");
         common_chat_templates_inputs inputs;
         inputs.messages              = msgs;
         inputs.add_generation_prompt = true;
+        inputs.use_jinja             = true;
 
-        // Support chat_template_kwargs.enable_thinking (same as llama-server)
+        if (has_tools) {
+            inputs.tools       = common_chat_tools_parse_oaicompat(tools_j);
+            inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(tool_choice);
+        }
+
+        // Parse reasoning_format
+        if (body.contains("reasoning_format")) {
+            inputs.reasoning_format = common_reasoning_format_from_name(body["reasoning_format"].get<std::string>());
+        }
+
+        // Parse enable_thinking from chat_template_kwargs
         if (body.contains("chat_template_kwargs")) {
             auto kwargs = body["chat_template_kwargs"];
-            if (kwargs.contains("enable_thinking")) {
-                auto val = kwargs["enable_thinking"];
-                if (val.is_boolean()) {
-                    inputs.enable_thinking = val.get<bool>();
-                }
+            for (const auto & item : kwargs.items()) {
+                inputs.chat_template_kwargs[item.key()] = item.value().dump();
+            }
+            auto et = kwargs.value("enable_thinking", json());
+            if (et.is_boolean()) {
+                inputs.enable_thinking = et.get<bool>();
             }
         }
 
         auto chat_params = common_chat_templates_apply(tmpls.get(), inputs);
         prompt = chat_params.prompt;
+        parser_params = common_chat_parser_params(chat_params);
+        parser_params.reasoning_format = inputs.reasoning_format;
+        parser_params.parse_tool_calls = has_tools;
+        if (!chat_params.parser.empty()) {
+            parser_params.parser.load(chat_params.parser);
+        }
+
+        // Save grammar info for sampler
+        grammar_str = chat_params.grammar;
+        grammar_lazy = chat_params.grammar_lazy;
+        grammar_triggers = chat_params.grammar_triggers;
+        preserved_tokens_str = chat_params.preserved_tokens;
+        generation_prompt_str = chat_params.generation_prompt;
+
+        // Merge additional stop sequences from template
+        for (const auto & s : chat_params.additional_stops) {
+            stop_words.push_back(s);
+        }
     }
 
     std::vector<llama_token> tokens =
@@ -1073,17 +1343,103 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
     const int64_t     created     = now_unix();
     const int32_t     n_prompt_toks = (int32_t)tokens.size();
 
+    // Per-request sampling parameters
+    auto req_sparams = g_engine.default_sparams;
+    if (body.contains("temperature"))       req_sparams.temp            = body["temperature"].get<float>();
+    if (body.contains("top_p"))             req_sparams.top_p           = body["top_p"].get<float>();
+    if (body.contains("top_k"))             req_sparams.top_k           = body["top_k"].get<int32_t>();
+    if (body.contains("min_p"))             req_sparams.min_p           = body["min_p"].get<float>();
+    if (body.contains("seed"))              req_sparams.seed            = body["seed"].get<uint32_t>();
+    if (body.contains("repeat_penalty"))    req_sparams.penalty_repeat  = body["repeat_penalty"].get<float>();
+    if (body.contains("frequency_penalty")) req_sparams.penalty_freq    = body["frequency_penalty"].get<float>();
+    if (body.contains("presence_penalty"))  req_sparams.penalty_present = body["presence_penalty"].get<float>();
+
+    // Setup per-request sampler (sampling params + optional grammar)
+    auto setup_request_sampler = [&]() {
+        auto sparams = req_sparams;
+
+        if (!grammar_str.empty()) {
+            sparams.grammar = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS, grammar_str);
+            sparams.grammar_lazy = grammar_lazy;
+            sparams.generation_prompt = generation_prompt_str;
+
+            const auto * vocab = llama_model_get_vocab(g_engine.model_tgt);
+            for (const auto & s : preserved_tokens_str) {
+                auto toks = common_tokenize(vocab, s, false, true);
+                for (auto tok : toks) sparams.preserved_tokens.insert(tok);
+            }
+            for (const auto & t : grammar_triggers) {
+                if (t.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+                    auto ids = common_tokenize(vocab, t.value, false, true);
+                    if (ids.size() == 1) {
+                        common_grammar_trigger trigger;
+                        trigger.type  = COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN;
+                        trigger.value = t.value;
+                        trigger.token = ids[0];
+                        sparams.grammar_triggers.push_back(std::move(trigger));
+                    } else {
+                        sparams.grammar_triggers.push_back({COMMON_GRAMMAR_TRIGGER_TYPE_WORD, t.value});
+                    }
+                } else {
+                    sparams.grammar_triggers.push_back(t);
+                }
+            }
+        }
+
+        if (g_engine.smpl_tgt) common_sampler_free(g_engine.smpl_tgt);
+        g_engine.smpl_tgt = common_sampler_init(g_engine.model_tgt, sparams);
+    };
+
+    auto restore_default_sampler = [&]() {
+        if (g_engine.smpl_tgt) common_sampler_free(g_engine.smpl_tgt);
+        g_engine.smpl_tgt = common_sampler_init(g_engine.model_tgt, g_engine.default_sparams);
+    };
+
     if (!stream) {
         std::string text;
+        bool stopped_by_word = false;
         GenerateResult gres;
         {
             std::lock_guard<std::mutex> lock(g_inference_mtx);
             g_engine.reset();
-            gres = g_engine.generate(tokens, max_tokens, [&text](const std::string & s) {
-                text += s; return true;
+            setup_request_sampler();
+            gres = g_engine.generate(tokens, max_tokens, [&text, &stop_words, &stopped_by_word](const std::string & s) {
+                text += s;
+                for (const auto & sw : stop_words) {
+                    if (!sw.empty() && text.size() >= sw.size() &&
+                        text.compare(text.size() - sw.size(), sw.size(), sw) == 0) {
+                        text.resize(text.size() - sw.size());
+                        stopped_by_word = true;
+                        return false;
+                    }
+                }
+                return true;
             });
+            restore_default_sampler();
         }
         if (gres.error) { send_err(res, 500, "generation error"); return; }
+
+        // Parse output for tools + thinking
+        common_chat_msg msg;
+        try {
+            msg = common_chat_parse(text, false, parser_params);
+        } catch (const std::exception & e) {
+            LOG_WRN("chat parse failed, trying fallback: %s\n", e.what());
+            msg = parse_qwen_xml_tool_calls(text);
+        }
+        if (msg.empty()) {
+            msg = parse_qwen_xml_tool_calls(text);
+        }
+        if (msg.empty()) {
+            msg.role    = "assistant";
+            msg.content = text;
+        }
+
+        std::string finish_reason = "length";
+        bool stopped_eos = !stopped_by_word && gres.n_generated < max_tokens;
+        if (stopped_by_word || stopped_eos) {
+            finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
+        }
 
         send_json(res, 200, {
             {"id",      cmpl_id},
@@ -1092,8 +1448,8 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
             {"model",   model_name},
             {"choices", json::array({{
                 {"index",         0},
-                {"message",       {{"role", "assistant"}, {"content", text}}},
-                {"finish_reason", "stop"},
+                {"message",       msg.to_json_oaicompat()},
+                {"finish_reason", finish_reason},
             }})},
             {"usage", {
                 {"prompt_tokens",     n_prompt_toks},
@@ -1106,19 +1462,148 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
         return;
     }
 
-    // streaming
+    // ── streaming ──
     auto session = std::make_shared<TokenStream>();
 
-    std::thread([session, tokens, max_tokens]() {
+    // Capture stop_words and parser_params for the streaming thread
+    auto stop_words_shared = std::make_shared<std::vector<std::string>>(std::move(stop_words));
+    auto parser_shared     = std::make_shared<common_chat_parser_params>(parser_params);
+
+    // Capture per-request sampler params by value for the streaming thread
+    auto req_sparams_copy          = req_sparams;
+    auto grammar_str_copy          = grammar_str;
+    auto grammar_lazy_copy         = grammar_lazy;
+    auto grammar_triggers_copy     = grammar_triggers;
+    auto preserved_tokens_str_copy = preserved_tokens_str;
+    auto generation_prompt_copy    = generation_prompt_str;
+
+    std::thread([session, tokens, max_tokens, stop_words_shared,
+                  req_sparams_copy, grammar_str_copy, grammar_lazy_copy,
+                  grammar_triggers_copy, preserved_tokens_str_copy,
+                  generation_prompt_copy]() {
         std::lock_guard<std::mutex> lock(g_inference_mtx);
         g_engine.reset();
-        auto gres = g_engine.generate(tokens, max_tokens, [&session](const std::string & s) {
-            session->push(s); return true;
-        });
-        session->finish(gres);
+
+        // Setup per-request sampler
+        {
+            auto sparams = req_sparams_copy;
+            if (!grammar_str_copy.empty()) {
+                sparams.grammar = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS, grammar_str_copy);
+                sparams.grammar_lazy = grammar_lazy_copy;
+                sparams.generation_prompt = generation_prompt_copy;
+                const auto * vocab = llama_model_get_vocab(g_engine.model_tgt);
+                for (const auto & s : preserved_tokens_str_copy) {
+                    auto toks = common_tokenize(vocab, s, false, true);
+                    for (auto tok : toks) sparams.preserved_tokens.insert(tok);
+                }
+                for (const auto & t : grammar_triggers_copy) {
+                    if (t.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+                        auto ids = common_tokenize(vocab, t.value, false, true);
+                        if (ids.size() == 1) {
+                            common_grammar_trigger trigger;
+                            trigger.type  = COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN;
+                            trigger.value = t.value;
+                            trigger.token = ids[0];
+                            sparams.grammar_triggers.push_back(std::move(trigger));
+                        } else {
+                            sparams.grammar_triggers.push_back({COMMON_GRAMMAR_TRIGGER_TYPE_WORD, t.value});
+                        }
+                    } else {
+                        sparams.grammar_triggers.push_back(t);
+                    }
+                }
+            }
+            if (g_engine.smpl_tgt) common_sampler_free(g_engine.smpl_tgt);
+            g_engine.smpl_tgt = common_sampler_init(g_engine.model_tgt, sparams);
+        }
+
+        // State machine: NORMAL → IN_THINK → AFTER_THINK → IN_TOOL_CALL
+        enum { ST_NORMAL, ST_IN_THINK, ST_AFTER_THINK, ST_IN_TOOL_CALL } state = ST_NORMAL;
+        std::string accum;
+        size_t sent_pos = 0;
+        bool stopped_word = false;
+        size_t max_holdback = 11; // <tool_call> length
+        for (const auto & sw : *stop_words_shared) {
+            max_holdback = std::max(max_holdback, sw.size());
+        }
+
+        auto flush_region = [&](size_t from, size_t to, const std::string & type) {
+            if (to <= from) return;
+            std::string text = accum.substr(from, to - from);
+            if (!text.empty()) session->push(text, type);
+        };
+
+        auto gres = g_engine.generate(tokens, max_tokens,
+            [&](const std::string & s) {
+                accum += s;
+
+                // Full stop word match
+                for (const auto & sw : *stop_words_shared) {
+                    if (!sw.empty() && accum.size() >= sw.size() &&
+                        accum.compare(accum.size() - sw.size(), sw.size(), sw) == 0) {
+                        accum.resize(accum.size() - sw.size());
+                        stopped_word = true;
+                        return false;
+                    }
+                }
+
+                // Partial stop word match - expand holdback
+                size_t holdback = max_holdback;
+                for (const auto & sw : *stop_words_shared) {
+                    size_t partial = string_find_partial_stop(accum, sw);
+                    if (partial != std::string::npos) {
+                        holdback = std::max(holdback, accum.size() - partial);
+                    }
+                }
+
+                if (state == ST_IN_TOOL_CALL) return true;
+
+                size_t search_from = sent_pos > holdback ? sent_pos - holdback : 0;
+
+                if (state == ST_NORMAL) {
+                    auto think_pos = accum.find("<think>", search_from);
+                    if (think_pos != std::string::npos && think_pos >= sent_pos) {
+                        flush_region(sent_pos, think_pos, "content");
+                        sent_pos = think_pos + 7;
+                        state = ST_IN_THINK;
+                    }
+                }
+
+                if (state == ST_IN_THINK) {
+                    auto end_pos = accum.find("</think>", search_from);
+                    if (end_pos != std::string::npos && end_pos >= sent_pos) {
+                        flush_region(sent_pos, end_pos, "reasoning_content");
+                        sent_pos = end_pos + 8;
+                        state = ST_AFTER_THINK;
+                    }
+                }
+
+                if (state == ST_AFTER_THINK || state == ST_NORMAL) {
+                    auto tc_pos = accum.find("<tool_call>", search_from);
+                    if (tc_pos != std::string::npos && tc_pos >= sent_pos) {
+                        flush_region(sent_pos, tc_pos, "content");
+                        sent_pos = accum.size();
+                        state = ST_IN_TOOL_CALL;
+                        return true;
+                    }
+                }
+
+                // Flush safe region (holding back for tag detection / partial stop)
+                size_t safe_pos = accum.size() > holdback ? accum.size() - holdback : 0;
+                while (safe_pos > sent_pos && (accum[safe_pos] & 0xC0) == 0x80) safe_pos--;
+                std::string type = (state == ST_IN_THINK) ? "reasoning_content" : "content";
+                flush_region(sent_pos, safe_pos, type);
+                if (safe_pos > sent_pos) sent_pos = safe_pos;
+
+                return true;
+            });
+        session->finish(gres, accum, stopped_word);
+        // Restore default sampler
+        if (g_engine.smpl_tgt) common_sampler_free(g_engine.smpl_tgt);
+        g_engine.smpl_tgt = common_sampler_init(g_engine.model_tgt, g_engine.default_sparams);
     }).detach();
 
-    auto make_chunk = [cmpl_id, created, model_name](const std::string & content, const char * finish_reason) {
+    auto make_chunk = [cmpl_id, created, model_name](const json & delta, const char * finish_reason) {
         return json{
             {"id",      cmpl_id},
             {"object",  "chat.completion.chunk"},
@@ -1126,27 +1611,17 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
             {"model",   model_name},
             {"choices", json::array({{
                 {"index",         0},
-                {"delta",         {{"content", content}}},
+                {"delta",         delta},
                 {"finish_reason", finish_reason ? json(finish_reason) : json(nullptr)},
             }})},
         };
     };
 
-    // Role chunk sent as initial data before chunked stream starts
-    std::string role_chunk = sse(json{
-        {"id",      cmpl_id},
-        {"object",  "chat.completion.chunk"},
-        {"created", created},
-        {"model",   model_name},
-        {"choices", json::array({{
-            {"index",         0},
-            {"delta",         {{"role", "assistant"}, {"content", ""}}},
-            {"finish_reason", nullptr},
-        }})},
-    });
+    // Role chunk
+    std::string role_chunk = sse(make_chunk({{"role", "assistant"}, {"content", ""}}, nullptr));
 
     res.set_chunked_content_provider("text/event-stream",
-        [session, make_chunk, n_prompt_toks,
+        [session, make_chunk, n_prompt_toks, parser_shared, max_tokens,
          role_chunk = std::move(role_chunk), role_sent = false](
              size_t, httplib::DataSink & sink) mutable -> bool {
             if (!role_sent) {
@@ -1154,14 +1629,52 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
                 role_sent = true;
                 return true;
             }
-            auto [tok_str, has_more] = session->pop();
+            auto [chunk_data, has_more] = session->pop();
             if (has_more) {
-                std::string chunk = sse(make_chunk(tok_str, nullptr));
+                json delta;
+                delta[chunk_data.type] = chunk_data.text;
+                std::string chunk = sse(make_chunk(delta, nullptr));
                 sink.write(chunk.data(), chunk.size());
                 return true;
             }
+            // Final: parse the full text for tool calls
             const auto & r = session->result;
-            json stop_chunk = make_chunk("", "stop");
+            const auto & full_text = session->full_text;
+            common_chat_msg msg;
+            try {
+                msg = common_chat_parse(full_text, false, *parser_shared);
+            } catch (const std::exception & e) {
+                LOG_WRN("chat parse failed, trying fallback: %s\n", e.what());
+                msg = parse_qwen_xml_tool_calls(full_text);
+            }
+            if (msg.empty()) {
+                msg = parse_qwen_xml_tool_calls(full_text);
+            }
+
+            std::string finish_reason = "length";
+            if (session->stopped_by_word || r.n_generated < max_tokens) {
+                finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
+            }
+
+            // Send tool_calls in a delta chunk if present
+            if (!msg.tool_calls.empty()) {
+                json tc_array = json::array();
+                for (size_t i = 0; i < msg.tool_calls.size(); i++) {
+                    tc_array.push_back({
+                        {"index", (int)i},
+                        {"id", msg.tool_calls[i].id.empty() ? "call_" + std::to_string(i) : msg.tool_calls[i].id},
+                        {"type", "function"},
+                        {"function", {
+                            {"name", msg.tool_calls[i].name},
+                            {"arguments", msg.tool_calls[i].arguments},
+                        }},
+                    });
+                }
+                std::string tc_chunk = sse(make_chunk({{"tool_calls", tc_array}}, nullptr));
+                sink.write(tc_chunk.data(), tc_chunk.size());
+            }
+
+            json stop_chunk = make_chunk(json::object(), finish_reason.c_str());
             stop_chunk["usage"] = {
                 {"prompt_tokens",     n_prompt_toks},
                 {"completion_tokens", r.n_generated},

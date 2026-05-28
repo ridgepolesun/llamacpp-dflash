@@ -79,9 +79,12 @@ int main(int argc, char ** argv) {
     if (!no_draft) {
         common_params params_dft = params;
         params_dft.model.path = params.speculative.mparams_dft.path;
-        // Draft context must fit n_predict + n_prompt + n_noise tokens in one batch
-        // (no KV cache; full ctx is recomputed each iteration).
+        // Draft model uses bidirectional (non-causal) attention: the entire batch
+        // [ctx_tokens + noise_tokens] must fit in a single micro-batch.
+        // Set n_batch = n_ubatch = n_ctx so n_dft never exceeds n_ubatch.
         params_dft.n_ctx      = params.n_ctx;
+        params_dft.n_batch    = params.n_ctx;
+        params_dft.n_ubatch   = params.n_ctx;
         dft_init  = common_init_from_params(params_dft);
         model_dft = dft_init->model();
         ctx_dft   = dft_init->context();
