@@ -342,23 +342,13 @@ struct DFlashEngine {
             } else {
                 bool rm_ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_cached, -1);
                 if (!rm_ok) {
-                    // SSM model can't do partial removal — restore snapshot if available
-                    if (cached_snap_valid) {
-                        if (cached_gpu_snap) {
-                            llama_gpu_snapshot_restore(ctx_tgt, cached_gpu_snap, 0,
-                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                        } else if (cached_recr_snap_written > 0) {
-                            llama_state_seq_set_data_ext(ctx_tgt, cached_recr_snap.data(),
-                                    cached_recr_snap_written, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                        }
-                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_cached, -1);
-                    } else {
-                        // No valid snapshot — full reset
-                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, -1, -1);
-                        if (ctx_dft)
-                            llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
-                        n_past_cached = 0;
-                    }
+                    // Hybrid model: partial removal always fails.
+                    // Fall back to full clear + re-prefill from scratch.
+                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, -1, -1);
+                    if (ctx_dft)
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+                    n_past_cached = 0;
+                    cached_snap_valid = false;
                 }
                 if (ctx_dft)
                     llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_past_cached, -1);
@@ -952,21 +942,29 @@ done:
                     t_total_s * 1e3, n_prompt + res.n_generated);
         }
 
-        // ── Rollback KV cache to prompt-only state for prefix cache ──
-        // After generation, KV has prompt + generated tokens. Remove generated
-        // tokens so next request can reuse the prompt prefix.
+        // ── Rollback to prompt-only state for prefix cache ──
+        // For hybrid models, partial seq_rm doesn't work. Clear all memory,
+        // then restore the SSM snapshot. KV cache is lost but SSM state preserved.
+        // The next request will re-prefill KV for matching prefix tokens.
         {
-            bool rm_ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_prompt, -1);
-            if (!rm_ok && use_recr_snap && cached_snap_valid) {
-                // Hybrid model: restore SSM to prompt-end state, then clear beyond prompt
-                if (cached_gpu_snap) {
-                    llama_gpu_snapshot_restore(ctx_tgt, cached_gpu_snap, 0,
-                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                } else if (cached_recr_snap_written > 0) {
-                    llama_state_seq_set_data_ext(ctx_tgt, cached_recr_snap.data(),
-                            cached_recr_snap_written, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            auto * mem = llama_get_memory(ctx_tgt);
+            bool rm_ok = llama_memory_seq_rm(mem, 0, n_prompt, -1);
+            if (!rm_ok) {
+                // Hybrid model: partial removal failed. Clear everything.
+                llama_memory_seq_rm(mem, 0, -1, -1);
+                if (ctx_dft) llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+                // Restore SSM snapshot so we don't lose recurrent state
+                if (use_recr_snap && cached_snap_valid) {
+                    if (cached_gpu_snap) {
+                        llama_gpu_snapshot_restore(ctx_tgt, cached_gpu_snap, 0,
+                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    } else if (cached_recr_snap_written > 0) {
+                        llama_state_seq_set_data_ext(ctx_tgt, cached_recr_snap.data(),
+                                cached_recr_snap_written, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
                 }
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_prompt, -1);
+                // Mark that KV cache needs full re-prefill
+                cached_prompt.clear();
             }
         }
 
