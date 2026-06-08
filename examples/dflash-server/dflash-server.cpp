@@ -174,10 +174,9 @@ struct DFlashEngine {
 
     // ── Prefix cache support ───────────────────────────────────────────────
     std::vector<llama_token> cached_prompt;
-    std::vector<uint8_t>     cached_recr_snap;   // SSM state at end of cached prompt
-    size_t                   cached_recr_snap_written = 0;
-    llama_gpu_snapshot *     cached_gpu_snap = nullptr;
-    bool                     cached_snap_valid = false;
+    std::vector<uint8_t>     cached_full_state;   // Full state (KV + SSM) at end of cached prompt
+    size_t                   cached_full_state_size = 0;
+    std::vector<float>       cached_ctx_proj;      // DFlash projections for cached prompt
 
     // ── Initialise engine (load models, allocate buffers) ──────────────────
     bool init(common_params & params, int32_t arg_draft_ctx_max) {
@@ -331,33 +330,28 @@ struct DFlashEngine {
             }
         }
 
-        // If prompt diverges from cache, we need to handle KV/SSM rollback
-        if (n_past_cached < (int32_t)cached_prompt.size()) {
-            // Try to remove tokens beyond the common prefix
-            if (n_past_cached == 0) {
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, -1, -1);
-                if (ctx_dft)
-                    llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
-                cached_snap_valid = false;
+        // Handle prefix cache: restore full state if prompt matches exactly
+        if (n_past_cached > 0 && n_past_cached == (int32_t)cached_prompt.size()
+                && cached_full_state_size > 0) {
+            // Exact match with cached prompt — restore full state (KV + SSM + ctx_proj)
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, -1, -1);
+            size_t n_set = llama_state_seq_set_data(ctx_tgt,
+                    cached_full_state.data(), cached_full_state_size, 0);
+            if (n_set > 0) {
+                // Restore DFlash projections
+                ctx_proj = cached_ctx_proj;
+                fprintf(stderr, "%s: prefix cache hit: %d / %d tokens reused (full state restore)\n",
+                        __func__, n_past_cached, n_prompt);
             } else {
-                bool rm_ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_cached, -1);
-                if (!rm_ok) {
-                    // Hybrid model: partial removal always fails.
-                    // Fall back to full clear + re-prefill from scratch.
-                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, -1, -1);
-                    if (ctx_dft)
-                        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
-                    n_past_cached = 0;
-                    cached_snap_valid = false;
-                }
-                if (ctx_dft)
-                    llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_past_cached, -1);
+                fprintf(stderr, "%s: prefix cache full state restore failed, re-prefilling\n", __func__);
+                n_past_cached = 0;
             }
-        }
-
-        if (n_past_cached > 0) {
-            fprintf(stderr, "%s: prefix cache hit: %d / %d tokens reused\n",
-                    __func__, n_past_cached, n_prompt);
+        } else if (n_past_cached < (int32_t)cached_prompt.size() || cached_full_state_size == 0) {
+            // Prompt changed or no cached state — full re-prefill
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, -1, -1);
+            if (ctx_dft)
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+            n_past_cached = 0;
         }
 
         // Process only the new tokens
@@ -450,26 +444,22 @@ struct DFlashEngine {
                 recr_snap_init_done = true;
             }
 
-            // Save SSM snapshot for prefix cache (for next request)
-            if (use_recr_snap) {
-                cached_snap_valid = false;
-                if (gpu_snap) {
-                    if (!cached_gpu_snap) {
-                        cached_gpu_snap = llama_gpu_snapshot_create(ctx_tgt);
-                    }
-                    if (cached_gpu_snap) {
-                        llama_gpu_snapshot_save(ctx_tgt, cached_gpu_snap, 0,
-                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                        cached_snap_valid = true;
-                    }
+            // Save full state (KV + SSM) and ctx_proj for prefix cache
+            {
+                const size_t sz = llama_state_seq_get_size(ctx_tgt, 0);
+                cached_full_state.resize(sz);
+                cached_full_state_size = llama_state_seq_get_data(ctx_tgt,
+                        cached_full_state.data(), sz, 0);
+                if (cached_full_state_size != sz) {
+                    fprintf(stderr, "%s: warning: full state save size mismatch (%zu vs %zu)\n",
+                            __func__, cached_full_state_size, sz);
+                    cached_full_state_size = 0;
                 } else {
-                    const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, 0,
-                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    cached_recr_snap.resize(sz);
-                    cached_recr_snap_written = llama_state_seq_get_data_ext(ctx_tgt,
-                            cached_recr_snap.data(), sz, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    cached_snap_valid = (cached_recr_snap_written == sz);
+                    fprintf(stderr, "%s: saved full state for prefix cache (%.1f MiB)\n",
+                            __func__, (float)sz / 1024 / 1024);
                 }
+                // Save DFlash projections
+                cached_ctx_proj = ctx_proj;
             }
         }
 
@@ -942,30 +932,12 @@ done:
                     t_total_s * 1e3, n_prompt + res.n_generated);
         }
 
-        // ── Rollback to prompt-only state for prefix cache ──
-        // For hybrid models, partial seq_rm doesn't work. Clear all memory,
-        // then restore the SSM snapshot. KV cache is lost but SSM state preserved.
-        // The next request will re-prefill KV for matching prefix tokens.
+        // ── Clear memory after generation for prefix cache ──
+        // Full state was saved during prefill. Just clear everything here.
+        // Next request will restore the full state if prompt matches.
         {
-            auto * mem = llama_get_memory(ctx_tgt);
-            bool rm_ok = llama_memory_seq_rm(mem, 0, n_prompt, -1);
-            if (!rm_ok) {
-                // Hybrid model: partial removal failed. Clear everything.
-                llama_memory_seq_rm(mem, 0, -1, -1);
-                if (ctx_dft) llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
-                // Restore SSM snapshot so we don't lose recurrent state
-                if (use_recr_snap && cached_snap_valid) {
-                    if (cached_gpu_snap) {
-                        llama_gpu_snapshot_restore(ctx_tgt, cached_gpu_snap, 0,
-                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    } else if (cached_recr_snap_written > 0) {
-                        llama_state_seq_set_data_ext(ctx_tgt, cached_recr_snap.data(),
-                                cached_recr_snap_written, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    }
-                }
-                // Mark that KV cache needs full re-prefill
-                cached_prompt.clear();
-            }
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, -1, -1);
+            if (ctx_dft) llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
         }
 
         return res;
